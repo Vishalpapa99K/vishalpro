@@ -218,15 +218,19 @@ def encrypt_response(data_dict):
 
 def encrypted_reply(data_dict):
     """
-    ALL responses are encrypted.
-    - If ECDH session exists: encrypt with session's shared key (NO hardcoded key used)
-    - Fallback: encrypt with static AES_KEY (old apps)
-    Network pe sirf encrypted string travel karti hai — unreadable.
+    Response handler:
+    - X-App-Version: 2 header → Plain JSON (new app, ECDH/no hardcoded key)
+    - ECDH session present → Encrypt with session key
+    - Default → Encrypt with static AES_KEY (legacy)
     """
-    session_id = request.headers.get('X-Session', '').strip()
+    # New app (v2) gets plain JSON — no decryption needed on client
+    app_version = request.headers.get('X-App-Version', '1')
+    if app_version == '2':
+        return jsonify(data_dict)
     
+    # ECDH session — encrypt with session key
+    session_id = request.headers.get('X-Session', '').strip()
     if session_id and session_id in _ecdh_sessions:
-        # Use ECDH-derived key — NOTHING hardcoded
         try:
             shared_key_bytes = bytes.fromhex(_ecdh_sessions[session_id]['shared_key'])[:16]
             plaintext = json.dumps(data_dict).encode('utf-8')
@@ -238,9 +242,9 @@ def encrypted_reply(data_dict):
             resp.headers['Content-Type'] = 'application/octet-stream'
             return resp
         except Exception:
-            pass  # Fall through to static key
+            pass
     
-    # Fallback: static AES_KEY (old app versions)
+    # Legacy: static AES_KEY
     encrypted = encrypt_response(data_dict)
     resp = make_response(encrypted, 200)
     resp.headers['Content-Type'] = 'application/octet-stream'
@@ -1407,6 +1411,9 @@ def add_attack_api():
     
     URL mein {ip}, {port}, {time} placeholder use karo.
     """
+    if attack_apis_col is None:
+        return jsonify({'error': 'Database not configured'}), 503
+    
     data = request.json or {}
     name = data.get('name', '').strip()
     url = data.get('url', '').strip()
@@ -1433,6 +1440,8 @@ def add_attack_api():
 @owner_required
 def update_attack_api():
     """Update an existing API (enable/disable, change URL, priority)"""
+    if attack_apis_col is None:
+        return jsonify({'error': 'Database not configured'}), 503
     data = request.json or {}
     api_id = data.get('id', '').strip()
     if not api_id:
@@ -1457,6 +1466,8 @@ def update_attack_api():
 @owner_required
 def delete_attack_api():
     """Delete an API"""
+    if attack_apis_col is None:
+        return jsonify({'error': 'Database not configured'}), 503
     data = request.json or {}
     api_id = data.get('id', '').strip()
     if not api_id:
