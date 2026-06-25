@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: vishalpro-panel
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn vishalpro:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    envVars:
+      - key: OWNER_USER
+        sync: false
+      - key: OWNER_PASS
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: HMAC_SECRET
+        sync: false
+      - key: AES_KEY
+        sync: false
+      - key: ATTACK_PROXY_URL
+        sync: false
+      - key: PROXY_SECRET
+        sync: false
