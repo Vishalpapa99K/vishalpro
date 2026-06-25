@@ -218,37 +218,22 @@ def encrypt_response(data_dict):
 
 def encrypted_reply(data_dict):
     """
-    Response handler:
-    - X-App-Version: 2 header → Plain JSON (new app, ECDH/no hardcoded key)
-    - ECDH session present → Encrypt with session key
-    - Default → Encrypt with static AES_KEY (legacy)
+    Response handler — always returns plain JSON for new apps.
+    Legacy apps (without X-App-Version header) still get AES encrypted.
     """
-    # New app (v2) gets plain JSON — no decryption needed on client
-    app_version = request.headers.get('X-App-Version', '1')
-    if app_version == '2':
+    # Always return plain JSON — encryption happens at transport layer (HTTPS)
+    app_version = request.headers.get('X-App-Version', '')
+    if app_version:
         return jsonify(data_dict)
     
-    # ECDH session — encrypt with session key
-    session_id = request.headers.get('X-Session', '').strip()
-    if session_id and session_id in _ecdh_sessions:
-        try:
-            shared_key_bytes = bytes.fromhex(_ecdh_sessions[session_id]['shared_key'])[:16]
-            plaintext = json.dumps(data_dict).encode('utf-8')
-            iv = os.urandom(16)
-            cipher = AES.new(shared_key_bytes, AES.MODE_CBC, iv)
-            ct = cipher.encrypt(pad(plaintext, AES.block_size))
-            encrypted = base64.b64encode(iv + ct).decode('utf-8')
-            resp = make_response(encrypted, 200)
-            resp.headers['Content-Type'] = 'application/octet-stream'
-            return resp
-        except Exception:
-            pass
-    
-    # Legacy: static AES_KEY
-    encrypted = encrypt_response(data_dict)
-    resp = make_response(encrypted, 200)
-    resp.headers['Content-Type'] = 'application/octet-stream'
-    return resp
+    # Legacy: AES encrypted (old apps without X-App-Version header)
+    try:
+        encrypted = encrypt_response(data_dict)
+        resp = make_response(encrypted, 200)
+        resp.headers['Content-Type'] = 'application/octet-stream'
+        return resp
+    except Exception:
+        return jsonify(data_dict)
 
 def proxy_attack(ip, port, time_sec):
     """
@@ -1857,9 +1842,10 @@ def connect_device():
         try:
             session_data = _ecdh_sessions.get(session_id)
             if not session_data:
-                # Session expired/invalid — fallback to plain JSON instead of error
-                data = request.json or {}
-                if not data:
+                # Session expired — try to parse as plain JSON
+                try:
+                    data = json.loads(raw_body.decode('utf-8'))
+                except Exception:
                     return jsonify({'valid': False, 'message': 'Session expired. Please re-login.'})
             
             shared_key_bytes = bytes.fromhex(session_data['shared_key'])[:16]  # Use first 16 bytes as AES key
