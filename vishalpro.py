@@ -369,6 +369,79 @@ def login_record_success(ip):
 
 
 # ══════════════════════════════════════════════════════════════════
+# API RATE LIMITER — protects /connect from DDoS/spam
+# Even if panel URL leaks, attackers can't take it down easily.
+# ══════════════════════════════════════════════════════════════════
+_api_requests = defaultdict(list)    # ip -> [timestamp, ...]
+_api_blocked = {}                    # ip -> unblock_timestamp
+
+# Config (override via env)
+API_MAX_REQUESTS = int(os.environ.get('API_MAX_REQUESTS', '30'))      # max requests per window
+API_WINDOW_SEC = int(os.environ.get('API_WINDOW_SEC', '60'))          # window = 60 seconds
+API_BLOCK_SEC = int(os.environ.get('API_BLOCK_SEC', '300'))           # block for 5 min after abuse
+API_ACCESS_TOKEN = os.environ.get('API_ACCESS_TOKEN', '')             # optional app-level token
+
+def api_check_rate(ip):
+    """Check if IP is allowed to make API requests. Returns (allowed, retry_after)."""
+    now = _time_mod.time()
+    # Currently blocked?
+    unblock_at = _api_blocked.get(ip)
+    if unblock_at and now < unblock_at:
+        return False, int(unblock_at - now)
+    if unblock_at and now >= unblock_at:
+        _api_blocked.pop(ip, None)
+        _api_requests.pop(ip, None)
+    # Prune old requests
+    cutoff = now - API_WINDOW_SEC
+    _api_requests[ip] = [t for t in _api_requests[ip] if t > cutoff]
+    if len(_api_requests[ip]) >= API_MAX_REQUESTS:
+        _api_blocked[ip] = now + API_BLOCK_SEC
+        print(f"[! API-RATE] Blocked IP {ip} for {API_BLOCK_SEC}s — {len(_api_requests[ip])} requests in {API_WINDOW_SEC}s")
+        return False, API_BLOCK_SEC
+    return True, 0
+
+def api_record_request(ip):
+    """Record an API request from this IP."""
+    _api_requests[ip].append(_time_mod.time())
+
+def validate_app_request():
+    """
+    Validate that the request comes from a legitimate app, not random scanner/attacker.
+    Checks:
+    1. Must be POST
+    2. Must have Content-Type: application/json (or octet-stream for encrypted)
+    3. Must have X-App-Version header (our app always sends this)
+    4. If API_ACCESS_TOKEN is set, must match X-Access-Token header
+    5. Body must not be empty
+    Returns (valid: bool, error_message: str)
+    """
+    # Check method
+    if request.method != 'POST':
+        return False, 'Method not allowed'
+    
+    # Check content type
+    ct = request.headers.get('Content-Type', '')
+    if 'json' not in ct and 'octet-stream' not in ct:
+        return False, 'Invalid content type'
+    
+    # Check app version header (all our app versions send this)
+    if not request.headers.get('X-App-Version') and not request.headers.get('X-Timestamp'):
+        return False, 'Missing required headers'
+    
+    # Check optional access token (if configured)
+    if API_ACCESS_TOKEN:
+        token = request.headers.get('X-Access-Token', '')
+        if token != API_ACCESS_TOKEN:
+            return False, 'Unauthorized'
+    
+    # Check body is not empty
+    if not request.get_data():
+        return False, 'Empty body'
+    
+    return True, ''
+
+
+# ══════════════════════════════════════════════════════════════════
 # AUTH HELPERS
 # ══════════════════════════════════════════════════════════════════
 
@@ -1157,17 +1230,17 @@ const priority=parseInt(document.getElementById('aPriority').value)||1;
 if(!name||!url){document.getElementById('aResult').innerHTML='<span style="color:#dc2626">⚠️ Name and URL required</span>';return}
 if(!url.includes('{ip}')||!url.includes('{port}')||!url.includes('{time}')){document.getElementById('aResult').innerHTML='<span style="color:#dc2626">⚠️ URL must contain {ip}, {port}, {time}</span>';return}
 document.getElementById('aResult').innerHTML='<span style="color:#3b82f6">⏳ Adding...</span>';
-const r=await api('/api/attack-apis/add',{name,url,priority});
+const r=await api('/api/attack-apis/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,url,priority})});
 if(r.error){document.getElementById('aResult').innerHTML='<span style="color:#dc2626">⚠️ '+r.error+'</span>'}
 else{document.getElementById('aResult').innerHTML='<span style="color:#10b981">✅ API Added!</span>';setTimeout(()=>showAttackApis(),800)}
 }
 async function toggleApi(id,enabled){
-await api('/api/attack-apis/update',{id,enabled});
+await api('/api/attack-apis/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,enabled})});
 showAttackApis();
 }
 async function deleteApi(id){
 if(!confirm('Delete this API?'))return;
-await api('/api/attack-apis/delete',{id});
+await api('/api/attack-apis/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
 showAttackApis();
 }
 async function uploadUpdate(){
@@ -1773,6 +1846,12 @@ _ecdh_sessions = {}
 @app.route('/api/handshake', methods=['POST'])
 def api_handshake():
     """ECDH Key Exchange — establishes encrypted channel with app"""
+    # Rate limit handshake too
+    ip = get_client_ip() or 'unknown'
+    allowed, retry_after = api_check_rate(ip)
+    if not allowed:
+        return jsonify({'success': False, 'message': f'Rate limited. Try after {retry_after}s'}), 429
+    api_record_request(ip)
     data = request.json or {}
     device_id = data.get('device_id', '').strip()
     client_pub_key_b64 = data.get('public_key', '').strip()
@@ -1830,6 +1909,18 @@ def api_handshake():
 
 @app.route('/connect', methods=['POST'])
 def connect_device():
+    # ── ANTI-DDOS: Rate limit + request validation ──
+    ip = get_client_ip() or 'unknown'
+    allowed, retry_after = api_check_rate(ip)
+    if not allowed:
+        return jsonify({'valid': False, 'message': f'Rate limited. Try after {retry_after}s'}), 429
+    api_record_request(ip)
+    
+    # Validate request looks like it came from our app
+    is_valid_req, err_msg = validate_app_request()
+    if not is_valid_req:
+        return jsonify({'valid': False, 'message': 'Bad request'}), 400
+
     # Try to decrypt incoming request
     raw_body = request.get_data()
     data = None
