@@ -58,7 +58,7 @@ OWNER_PASS = os.getenv('OWNER_PASS', '')
 
 # MongoDB
 MONGO_URI = os.getenv('MONGO_URI', '')
-MONGO_DB_NAME = os.getenv('MONGO_DB_NAME', '_panel')
+MONGO_DB_NAME = os.getenv('MONGO_DB_NAME', 'alonexraj_panel')
 
 # Warn loudly if critical vars are missing — but don't crash on import
 _missing = [k for k, v in {
@@ -1409,13 +1409,9 @@ def api_generate():
         expires_at_val = None
         redeemed = False
     else:
-        if duration_unit == 'minutes':
-            expires_at_val = (created_at + timedelta(minutes=duration_value)).isoformat() + 'Z'
-        elif duration_unit == 'hours':
-            expires_at_val = (created_at + timedelta(hours=duration_value)).isoformat() + 'Z'
-        else:
-            expires_at_val = (created_at + timedelta(days=duration_value)).isoformat() + 'Z'
-        redeemed = True
+        # Multi-device: also start timer on first redeem (not at generation)
+        expires_at_val = None
+        redeemed = False
 
     record = {
         'id': secrets.token_hex(8),
@@ -1639,8 +1635,8 @@ def connect_init():
     if not found_key:
         return make_encoded_response({'valid': False, 'message': 'Invalid key'})
 
-    # --- Expiry on first redeem (single device keys) ---
-    if found_key.get('device_limit', 1) == 1 and (not found_key.get('redeemed') or not found_key.get('expires_at')):
+    # --- Expiry on first redeem (ALL keys — timer starts when first device connects) ---
+    if not found_key.get('redeemed') or not found_key.get('expires_at'):
         now = datetime.utcnow()
         duration_value = found_key.get('duration_value', 1)
         duration_unit = found_key.get('duration_unit', 'hours')
@@ -1734,12 +1730,15 @@ def connect_init():
     }
     challenges_col.insert_one(challenge_doc)
 
-    # Return challenge to app (encoded)
+    # Return challenge to app (encoded) — include key info for display
     return make_encoded_response({
         'valid': True,
         'challenge_id': challenge_id,
         'challenge': base64.b64encode(challenge_bytes).decode('utf-8'),
-        'message': 'Challenge issued'
+        'message': 'Challenge issued',
+        'expires_at': found_key.get('expires_at', ''),
+        'plan': found_key.get('plan', 'Premium'),
+        'max_devices': found_key.get('device_limit', 1)
     })
 
 
