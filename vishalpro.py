@@ -14,7 +14,7 @@ from pymongo import MongoClient
 
 # ═══════════════════════════════════════════════════════════════════
 # ENV LOADER — supports .env file (no external dep)
-# Load order: ENV_FILE env var > alonexraj.env > .env
+# Load order: ENV_FILE env var > V-DD©S.env > .env
 # Existing os.environ values are NOT overridden (real env wins).
 # ═══════════════════════════════════════════════════════════════════
 def _load_env_file(path):
@@ -39,7 +39,7 @@ def _load_env_file(path):
         print(f"[! ENV] Failed to load {path}: {e}")
         return False
 
-_env_candidates = [os.environ.get('ENV_FILE'), 'alonexraj.env', '.env']
+_env_candidates = [os.environ.get('ENV_FILE'), 'V-DD©S.env', '.env']
 for _p in _env_candidates:
     if _load_env_file(_p):
         break
@@ -48,7 +48,7 @@ app = Flask(__name__)
 
 # ═══════════════════════════════════════════════════════════════════
 # CONFIG — values from .env, fallback to empty string
-# Set them in alonexraj.env (local) OR Render/Railway env vars (production)
+# Set them in V-DD©S.env (local) OR Render/Railway env vars (production)
 # ═══════════════════════════════════════════════════════════════════
 app.secret_key = os.getenv('FLASK_SECRET_KEY', '') or secrets.token_hex(16)
 
@@ -58,7 +58,7 @@ OWNER_PASS = os.getenv('OWNER_PASS', '')
 
 # MongoDB
 MONGO_URI = os.getenv('MONGO_URI', '')
-MONGO_DB_NAME = os.getenv('MONGO_DB_NAME', 'alonexraj_panel')
+MONGO_DB_NAME = os.getenv('MONGO_DB_NAME', 'V-DD©S_panel')
 
 # Warn loudly if critical vars are missing — but don't crash on import
 _missing = [k for k, v in {
@@ -1962,8 +1962,10 @@ def _fire_attack_api(api_config, host, port, time_val):
 
         timeout = api_config.get('timeout', 12)
         resp = requests.get(url, timeout=timeout)
+        body = resp.text.lower()
 
-        if resp.status_code == 200:
+        # Success = 2xx status code OR "success" found in response body
+        if 200 <= resp.status_code < 300 or 'success' in body:
             return True, f'Attack sent via {api_config["name"]}', resp.status_code
         else:
             return False, f'{api_config["name"]} returned {resp.status_code}', resp.status_code
