@@ -79,6 +79,7 @@ history_col = db['key_history'] if db is not None else None
 attack_apis_col = db['attack_apis'] if db is not None else None
 challenges_col = db['challenges'] if db is not None else None
 sessions_col = db['sessions'] if db is not None else None
+attack_logs_col = db['attack_logs'] if db is not None else None
 
 # Create TTL index on challenges collection (expires_at field) — MongoDB auto-deletes expired docs
 if challenges_col is not None:
@@ -802,8 +803,17 @@ container.innerHTML=`
 <div style="display:flex;gap:10px;flex-wrap:wrap">
 <button class="btn btn-purple" onclick="showHistory()">📜 Key History</button>
 </div>
+</div>
+
+<div class="section">
+<div class="section-head">
+<div class="se-icon" style="background:linear-gradient(135deg,#f59e0b,#ea580c);box-shadow:0 4px 12px rgba(245,158,11,.25)">🚀</div>
+<div class="se-text"><h3>Attack Logs</h3><p>Recent attack history</p></div>
+</div>
+<div id="attackLogsTable">Loading...</div>
 </div>`;
 loadAttackApis();
+loadAttackLogs();
 }
 
 // ATTACK APIs SECTION
@@ -1131,6 +1141,30 @@ if(history.length===0)html+=`<tr><td colspan="4"><div class="empty"><div class="
 html+=`</tbody></table></div>`;
 showModal(html);
 }
+
+async function showAttackLogs(){
+// kept for backward compat — now loads inline
+loadAttackLogs();
+}
+
+async function loadAttackLogs(){
+const logs=await api('/api/attack-logs');
+const el=document.getElementById('attackLogsTable');
+if(!el)return;
+if(logs.length===0){
+el.innerHTML=`<div class="empty"><div class="empty-icon">🚀</div><p>No attacks yet</p><span>Attacks will appear here automatically</span></div>`;
+return;
+}
+el.innerHTML=`<div class="table-wrap" style="max-height:350px;overflow-y:auto"><table><thead><tr><th>Target (IP:Port×Time)</th><th>Key</th><th>Device IP</th><th>Status</th><th>When</th></tr></thead><tbody>${logs.map(l=>{
+const statusBadge=l.status==='success'?'<span class="badge badge-active">✓ Sent</span>':'<span class="badge badge-expired">✗ Failed</span>';
+const when=l.timestamp?new Date(l.timestamp).toLocaleString():'—';
+const target=`${l.host||'—'}:${l.port||'—'} × ${l.time||'—'}s`;
+return `<tr><td class="mono" style="font-size:12px">${target}</td><td style="font-size:11px">${l.key_name||'—'}</td><td style="font-size:11px;font-family:monospace">${l.ip_address||'—'}</td><td>${statusBadge}</td><td style="font-size:11px">${when}</td></tr>`;
+}).join('')}</tbody></table></div>`;
+}
+
+// Auto-refresh attack logs every 30 seconds
+setInterval(loadAttackLogs, 30000);
 
 async function showDevices(keyId,btn){
 const row=document.getElementById('dev_'+keyId);
@@ -1985,6 +2019,24 @@ def _handle_attack_from_session(data, found_key):
                 break  # First success = stop
 
     if results:
+        # Log attack to database
+        if attack_logs_col is not None:
+            try:
+                attack_logs_col.insert_one({
+                    'host': host,
+                    'port': port,
+                    'time': time_val,
+                    'key': found_key.get('key', ''),
+                    'key_name': found_key.get('name', ''),
+                    'device_id': data.get('device_id', ''),
+                    'ip_address': get_client_ip(),
+                    'apis_used': ' | '.join(results),
+                    'status': 'success',
+                    'timestamp': datetime.utcnow().isoformat() + 'Z'
+                })
+            except Exception:
+                pass
+
         return make_encoded_response({
             'valid': True,
             'attack': True,
@@ -1994,7 +2046,24 @@ def _handle_attack_from_session(data, found_key):
             'time': time_val
         })
 
-    # All APIs failed
+    # All APIs failed — log failure too
+    if attack_logs_col is not None:
+        try:
+            attack_logs_col.insert_one({
+                'host': host,
+                'port': port,
+                'time': time_val,
+                'key': found_key.get('key', ''),
+                'key_name': found_key.get('name', ''),
+                'device_id': data.get('device_id', ''),
+                'ip_address': get_client_ip(),
+                'apis_used': '',
+                'status': 'failed',
+                'timestamp': datetime.utcnow().isoformat() + 'Z'
+            })
+        except Exception:
+            pass
+
     return make_encoded_response({'valid': True, 'attack': False, 'message': 'All attack APIs failed. Try again later.'})
 
 
@@ -2102,6 +2171,20 @@ def api_attack_apis_test():
         'message': message,
         'status_code': status_code
     })
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ATTACK LOGS — History of all attacks from app
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route('/api/attack-logs', methods=['GET'])
+@login_required
+def api_attack_logs():
+    """Get recent attack logs (last 100)."""
+    if attack_logs_col is None:
+        return jsonify([])
+    logs = list(attack_logs_col.find({}, {'_id': 0}).sort('timestamp', -1).limit(100))
+    return jsonify(logs)
 
 
 
