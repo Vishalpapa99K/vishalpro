@@ -381,7 +381,7 @@ LOGIN_TEMPLATE = '''<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ALONExRAJ Panel – Login</title>
+<title>V-DDOS Panel – Login</title>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box;font-family:'Plus Jakarta Sans',sans-serif}
@@ -445,7 +445,7 @@ cursor:pointer;transition:.25s;margin-top:8px;box-shadow:0 8px 24px rgba(139,92,
 <path d="M9 12l2 2 4-4" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
 </div>
-<h1>ALONExRAJ</h1>
+<h1>V-DDOS</h1>
 <div class="tagline">Premium Key Management & Reseller Panel</div>
 <div class="feats">
 <div class="feat"><div class="dot"></div>Secure Key Generation</div>
@@ -462,7 +462,7 @@ cursor:pointer;transition:.25s;margin-top:8px;box-shadow:0 8px 24px rgba(139,92,
 <div class="ig"><label>Password</label><input name="password" type="password" placeholder="••••••••••" required></div>
 <button type="submit" class="btn-submit">Sign In</button>
 </form>
-<div class="ft">© 2025 <span>ALONExRAJ</span> Premium Panel</div>
+<div class="ft">© 2025 <span>V-DDOS</span> Premium Panel</div>
 </div>
 </div>
 <script>
@@ -2210,7 +2210,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 3000))
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
 
-    print(f"[✓] Starting ALONExRAJ Panel v4.0 on port {port}")
+    print(f"[✓] Starting V-DDOS Panel v4.0 on port {port}")
     print(f"[✓] Debug mode: {debug_mode}")
     print(f"[✓] Health check available at: http://localhost:{port}/health")
     print(f"[✓] Keep-alive active - will ping every 4 minutes")
