@@ -14,7 +14,7 @@ from pymongo import MongoClient
 
 # ═══════════════════════════════════════════════════════════════════
 # ENV LOADER — supports .env file (no external dep)
-# Load order: ENV_FILE env var > THUNDER.env > .env
+# Load order: ENV_FILE env var > alonexraj.env > .env
 # Existing os.environ values are NOT overridden (real env wins).
 # ═══════════════════════════════════════════════════════════════════
 def _load_env_file(path):
@@ -39,7 +39,7 @@ def _load_env_file(path):
         print(f"[! ENV] Failed to load {path}: {e}")
         return False
 
-_env_candidates = [os.environ.get('ENV_FILE'), 'THUNDER.env', '.env']
+_env_candidates = [os.environ.get('ENV_FILE'), 'alonexraj.env', '.env']
 for _p in _env_candidates:
     if _load_env_file(_p):
         break
@@ -48,7 +48,7 @@ app = Flask(__name__)
 
 # ═══════════════════════════════════════════════════════════════════
 # CONFIG — values from .env, fallback to empty string
-# Set them in THUNDER.env (local) OR Render/Railway env vars (production)
+# Set them in alonexraj.env (local) OR Render/Railway env vars (production)
 # ═══════════════════════════════════════════════════════════════════
 app.secret_key = os.getenv('FLASK_SECRET_KEY', '') or secrets.token_hex(16)
 
@@ -58,7 +58,7 @@ OWNER_PASS = os.getenv('OWNER_PASS', '')
 
 # MongoDB
 MONGO_URI = os.getenv('MONGO_URI', '')
-MONGO_DB_NAME = os.getenv('MONGO_DB_NAME', 'THUNDER_panel')
+MONGO_DB_NAME = os.getenv('MONGO_DB_NAME', 'alonexraj_panel')
 
 # Warn loudly if critical vars are missing — but don't crash on import
 _missing = [k for k, v in {
@@ -185,6 +185,17 @@ def health_check():
         'service': 'THUNDER Panel',
         'version': '4.0'
     })
+
+
+@app.route('/myip', methods=['GET'])
+def my_ip():
+    """Returns the public outbound IP of this server"""
+    try:
+        import urllib.request
+        ip = urllib.request.urlopen('https://api.ipify.org').read().decode()
+        return jsonify({'ip': ip})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 def start_keep_alive():
@@ -370,7 +381,7 @@ LOGIN_TEMPLATE = '''<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>THUNDER Panel – Login</title>
+<title>ALONExRAJ Panel – Login</title>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box;font-family:'Plus Jakarta Sans',sans-serif}
@@ -434,7 +445,7 @@ cursor:pointer;transition:.25s;margin-top:8px;box-shadow:0 8px 24px rgba(139,92,
 <path d="M9 12l2 2 4-4" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
 </div>
-<h1>THUNDER</h1>
+<h1>ALONExRAJ</h1>
 <div class="tagline">Premium Key Management & Reseller Panel</div>
 <div class="feats">
 <div class="feat"><div class="dot"></div>Secure Key Generation</div>
@@ -451,7 +462,7 @@ cursor:pointer;transition:.25s;margin-top:8px;box-shadow:0 8px 24px rgba(139,92,
 <div class="ig"><label>Password</label><input name="password" type="password" placeholder="••••••••••" required></div>
 <button type="submit" class="btn-submit">Sign In</button>
 </form>
-<div class="ft">© 2025 <span>THUNDER</span> Premium Panel</div>
+<div class="ft">© 2025 <span>ALONExRAJ</span> Premium Panel</div>
 </div>
 </div>
 <script>
@@ -647,7 +658,7 @@ tr:hover td{background:var(--row-hover)}
 <body>
 <div class="topbar">
 <div class="brand-wrap">
-<div class="brand-icon">A</div>
+<div class="brand-icon">T</div>
 <div class="brand">THUNDER</div>
 </div>
 <div class="user-info">
@@ -802,7 +813,9 @@ container.innerHTML=`
 </div>
 <div style="display:flex;gap:10px;flex-wrap:wrap">
 <button class="btn btn-purple" onclick="showHistory()">📜 Key History</button>
+<button class="btn btn-blue" onclick="checkServerIp()">🌐 Check Server IP</button>
 </div>
+<div id="serverIpResult" style="margin-top:10px;font-size:13px;font-family:monospace"></div>
 </div>
 
 <div class="section">
@@ -996,6 +1009,10 @@ container.innerHTML=`
 }
 
 // ACTIONS
+async function checkServerIp(){
+document.getElementById('serverIpResult').innerHTML='<span style="color:var(--primary)">⏳ Checking...</span>';
+try{const r=await api('/myip');document.getElementById('serverIpResult').innerHTML=`<div style="padding:12px 14px;background:#f0fdf4;border-left:3px solid #10b981;border-radius:8px;color:#065f46">🌐 Server Public IP: <strong style="color:#10b981">${r.ip}</strong></div>`;}catch(e){document.getElementById('serverIpResult').innerHTML=`<span style="color:#dc2626">⚠️ Error: ${e.message}</span>`;}
+}
 async function generateKey(){
 const r=await api('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:document.getElementById('kName').value,duration_value:document.getElementById('kDur').value,duration_unit:document.getElementById('kUnit').value,device_limit:document.getElementById('kDev').value})});
 document.getElementById('genResult').innerHTML=r.error?`<span style="color:#dc2626">⚠️ ${r.error}</span>`:`<div style="padding:12px 14px;background:#f0fdf4;border-left:3px solid #10b981;border-radius:8px;color:#065f46">✅ Generated: <strong style="color:#10b981;cursor:pointer" onclick="copyKey('${r.key}')">${r.key}</strong></div>`;
@@ -2193,7 +2210,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 3000))
     debug_mode = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
 
-    print(f"[✓] Starting THUNDER Panel v4.0 on port {port}")
+    print(f"[✓] Starting ALONExRAJ Panel v4.0 on port {port}")
     print(f"[✓] Debug mode: {debug_mode}")
     print(f"[✓] Health check available at: http://localhost:{port}/health")
     print(f"[✓] Keep-alive active - will ping every 4 minutes")
