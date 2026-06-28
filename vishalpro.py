@@ -182,7 +182,7 @@ def health_check():
     return jsonify({
         'status': 'alive',
         'timestamp': datetime.utcnow().isoformat() + 'Z',
-        'service': 'THUNDER Panel',
+        'service': 'V-DDOS Panel',
         'version': '4.0'
     })
 
@@ -659,7 +659,7 @@ tr:hover td{background:var(--row-hover)}
 <div class="topbar">
 <div class="brand-wrap">
 <div class="brand-icon">T</div>
-<div class="brand">THUNDER</div>
+<div class="brand">V-DDOS</div>
 </div>
 <div class="user-info">
 <span>{{ display_name }}</span>
@@ -1329,7 +1329,7 @@ def dashboard():
         r = find_reseller(session['username'])
         credits = r['credits'] if r else 0
     return render_template_string(DASHBOARD_TEMPLATE,
-        title='THUNDER Panel',
+        title='V-DDOS Panel',
         role=session['role'],
         username=session['username'],
         display_name=session['display_name'],
