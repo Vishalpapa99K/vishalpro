@@ -183,7 +183,7 @@ def health_check():
     return jsonify({
         'status': 'alive',
         'timestamp': datetime.utcnow().isoformat() + 'Z',
-        'service': 'V-DDOS Panel',
+        'service': 'V-DDOS ',
         'version': '4.0'
     })
 
@@ -204,7 +204,7 @@ def my_ip():
 @app.route('/api/broadcast', methods=['POST'])
 def send_broadcast():
     """Admin sends a broadcast message to all app users"""
-    if 'owner' not in session:
+    if not session.get('logged_in') or session.get('role') != 'owner':
         return jsonify({'error': 'Unauthorized'}), 401
     data = request.get_json()
     message = (data.get('message', '') if data else '').strip()
@@ -233,7 +233,7 @@ def get_latest_broadcast():
 @app.route('/api/broadcast/clear', methods=['POST'])
 def clear_broadcasts():
     """Clear all active broadcasts"""
-    if 'owner' not in session:
+    if not session.get('logged_in') or session.get('role') != 'owner':
         return jsonify({'error': 'Unauthorized'}), 401
     if broadcasts_col is not None:
         broadcasts_col.update_many({'active': True}, {'$set': {'active': False}})
@@ -423,7 +423,7 @@ LOGIN_TEMPLATE = '''<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>V-DDOS Panel – Login</title>
+<title>V-DDOS – Login</title>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box;font-family:'Plus Jakarta Sans',sans-serif}
@@ -1513,7 +1513,7 @@ def dashboard():
         r = find_reseller(session['username'])
         credits = r['credits'] if r else 0
     return render_template_string(DASHBOARD_TEMPLATE,
-        title='V-DDOS Panel',
+        title='V-DDOS ',
         role=session['role'],
         username=session['username'],
         display_name=session['display_name'],
