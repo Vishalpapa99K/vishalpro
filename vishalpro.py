@@ -423,7 +423,7 @@ LOGIN_TEMPLATE = '''<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>V-DDOS – Login</title>
+<title>V-DDOS Panel – Login</title>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box;font-family:'Plus Jakarta Sans',sans-serif}
@@ -560,6 +560,118 @@ DASHBOARD_TEMPLATE = '''<!doctype html>
   --glow-purple:0 0 20px rgba(124,77,255,.3);
   --glow-cyan:0 0 20px rgba(0,229,255,.2);
 }
+[data-theme="neon"]{
+  --bg-grad:linear-gradient(160deg,#0a0a1a 0%,#0d0b1f 40%,#12082a 100%);
+  --surface:rgba(18,14,36,0.85);
+  --surface-2:rgba(25,20,50,0.9);
+  --surface-3:rgba(35,28,65,0.8);
+  --border:rgba(124,77,255,0.15);
+  --border-2:rgba(124,77,255,0.25);
+  --text:#f0f0ff;
+  --text-muted:#a0a0c0;
+  --text-soft:#6b6b8a;
+  --primary:#7c4dff;
+  --primary-hover:#b388ff;
+  --shadow-sm:0 2px 12px rgba(124,77,255,.08);
+  --shadow:0 4px 20px rgba(124,77,255,.12);
+  --shadow-lg:0 8px 32px rgba(0,0,0,.4);
+  --modal-bg:rgba(5,3,15,.85);
+  --row-hover:rgba(124,77,255,.06);
+  --table-head:rgba(20,16,40,.95);
+  --logout-bg:rgba(220,38,38,.12);
+  --logout-color:#ff6b6b;
+  --logout-hover:rgba(220,38,38,.2);
+  --link:#00e5ff;
+  --countdown-active:#00e676;
+  --countdown-warn:#ffab00;
+  --countdown-danger:#ff1744;
+  --empty-icon-bg:rgba(124,77,255,.1);
+  --empty-icon-color:#4b4b6a;
+}
+[data-theme="cyber"]{
+  --bg-grad:linear-gradient(160deg,#001a0a 0%,#00120d 40%,#002015 100%);
+  --surface:rgba(0,30,15,0.85);
+  --surface-2:rgba(0,45,25,0.9);
+  --surface-3:rgba(0,60,30,0.8);
+  --border:rgba(0,230,118,0.15);
+  --border-2:rgba(0,230,118,0.25);
+  --text:#e0fff0;
+  --text-muted:#80c0a0;
+  --text-soft:#4a8a6a;
+  --primary:#00e676;
+  --primary-hover:#69f0ae;
+  --shadow-sm:0 2px 12px rgba(0,230,118,.08);
+  --shadow:0 4px 20px rgba(0,230,118,.12);
+  --shadow-lg:0 8px 32px rgba(0,0,0,.4);
+  --modal-bg:rgba(0,5,3,.85);
+  --row-hover:rgba(0,230,118,.06);
+  --table-head:rgba(0,20,10,.95);
+  --logout-bg:rgba(220,38,38,.12);
+  --logout-color:#ff6b6b;
+  --logout-hover:rgba(220,38,38,.2);
+  --link:#00e5ff;
+  --countdown-active:#00e676;
+  --countdown-warn:#ffab00;
+  --countdown-danger:#ff1744;
+  --empty-icon-bg:rgba(0,230,118,.1);
+  --empty-icon-color:#2a5a3a;
+}
+[data-theme="royal"]{
+  --bg-grad:linear-gradient(160deg,#1a0a00 0%,#1f0d00 40%,#2a1200 100%);
+  --surface:rgba(36,18,0,0.85);
+  --surface-2:rgba(50,25,0,0.9);
+  --surface-3:rgba(65,35,0,0.8);
+  --border:rgba(255,145,0,0.15);
+  --border-2:rgba(255,145,0,0.25);
+  --text:#fff5e0;
+  --text-muted:#c0a060;
+  --text-soft:#8a6a3a;
+  --primary:#ff9100;
+  --primary-hover:#ffab40;
+  --shadow-sm:0 2px 12px rgba(255,145,0,.08);
+  --shadow:0 4px 20px rgba(255,145,0,.12);
+  --shadow-lg:0 8px 32px rgba(0,0,0,.4);
+  --modal-bg:rgba(15,5,0,.85);
+  --row-hover:rgba(255,145,0,.06);
+  --table-head:rgba(30,15,0,.95);
+  --logout-bg:rgba(220,38,38,.12);
+  --logout-color:#ff6b6b;
+  --logout-hover:rgba(220,38,38,.2);
+  --link:#ffd740;
+  --countdown-active:#00e676;
+  --countdown-warn:#ffab00;
+  --countdown-danger:#ff1744;
+  --empty-icon-bg:rgba(255,145,0,.1);
+  --empty-icon-color:#5a3a1a;
+}
+[data-theme="midnight"]{
+  --bg-grad:linear-gradient(160deg,#050510 0%,#0a0a1e 40%,#0f0f28 100%);
+  --surface:rgba(10,10,30,0.9);
+  --surface-2:rgba(15,15,45,0.9);
+  --surface-3:rgba(25,25,60,0.8);
+  --border:rgba(0,229,255,0.15);
+  --border-2:rgba(0,229,255,0.25);
+  --text:#e0f7ff;
+  --text-muted:#80b8d0;
+  --text-soft:#4a7a90;
+  --primary:#00e5ff;
+  --primary-hover:#18ffff;
+  --shadow-sm:0 2px 12px rgba(0,229,255,.08);
+  --shadow:0 4px 20px rgba(0,229,255,.12);
+  --shadow-lg:0 8px 32px rgba(0,0,0,.4);
+  --modal-bg:rgba(2,2,10,.85);
+  --row-hover:rgba(0,229,255,.06);
+  --table-head:rgba(8,8,25,.95);
+  --logout-bg:rgba(220,38,38,.12);
+  --logout-color:#ff6b6b;
+  --logout-hover:rgba(220,38,38,.2);
+  --link:#00e5ff;
+  --countdown-active:#00e676;
+  --countdown-warn:#ffab00;
+  --countdown-danger:#ff1744;
+  --empty-icon-bg:rgba(0,229,255,.1);
+  --empty-icon-color:#2a4a5a;
+}
 [data-theme="dark"]{
   --bg-grad:linear-gradient(160deg,#0a0a1a 0%,#0d0b1f 40%,#12082a 100%);
   --surface:rgba(18,14,36,0.85);
@@ -599,12 +711,8 @@ body::before{content:'';position:fixed;top:0;left:0;width:100%;height:100%;backg
 .topbar .user-info span{color:var(--text);font-weight:600}
 .topbar a.logout-link{color:var(--logout-color);text-decoration:none;font-size:13px;font-weight:600;padding:7px 14px;border-radius:8px;background:var(--logout-bg);transition:.2s}
 .topbar a.logout-link:hover{background:var(--logout-hover)}
-.theme-toggle{background:var(--surface-3);border:none;color:var(--text);width:36px;height:36px;border-radius:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;transition:.2s}
-.theme-toggle:hover{background:var(--border-2);transform:scale(1.05)}
-.theme-toggle .sun{display:none}
-.theme-toggle .moon{display:block}
-[data-theme="dark"] .theme-toggle .sun{display:block}
-[data-theme="dark"] .theme-toggle .moon{display:none}
+.theme-toggle{background:var(--surface-3);border:1px solid var(--border-2);color:var(--text);width:36px;height:36px;border-radius:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;transition:.25s}
+.theme-toggle:hover{background:var(--border-2);transform:scale(1.1);box-shadow:0 0 12px var(--primary)}
 .container{max-width:1100px;margin:0 auto;padding:24px 20px 60px}
 .hero{background:rgba(18,14,36,.7);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);border-radius:20px;padding:24px 26px;margin-bottom:20px;display:flex;align-items:center;gap:18px;box-shadow:var(--glow-purple);position:relative;overflow:hidden;border:1px solid rgba(124,77,255,.2)}
 .hero::before{content:'';position:absolute;width:250px;height:250px;border-radius:50%;background:radial-gradient(circle,rgba(124,77,255,.15),transparent 70%);top:-100px;right:-80px}
@@ -710,7 +818,7 @@ tr:hover td{background:var(--row-hover)}
 <div class="user-info">
 <span>{{ display_name }}</span>
 {% if role == 'reseller' %}<span class="credit-badge">{{ credits }} Credits</span>{% endif %}
-<button class="theme-toggle" onclick="toggleTheme()" title="Toggle theme"><span class="sun">☀️</span><span class="moon">🌙</span></button>
+<button class="theme-toggle" onclick="toggleTheme()" title="Switch theme">🎨</button>
 <a class="logout-link" href="/logout">Sign out</a>
 </div>
 </div>
@@ -738,17 +846,18 @@ function applyTheme(t){
   document.documentElement.setAttribute('data-theme', t);
   try{localStorage.setItem('theme', t);}catch(e){}
 }
+const THEMES=['neon','cyber','royal','midnight'];
+let currentThemeIdx=0;
 function toggleTheme(){
-  const cur=document.documentElement.getAttribute('data-theme')||'light';
-  applyTheme(cur==='dark'?'light':'dark');
+  currentThemeIdx=(currentThemeIdx+1)%THEMES.length;
+  applyTheme(THEMES[currentThemeIdx]);
 }
 
 (function(){
   let saved=null;
   try{saved=localStorage.getItem('theme');}catch(e){}
-  if(saved){applyTheme(saved);return}
-  const prefersDark=window.matchMedia&&window.matchMedia('(prefers-color-scheme: dark)').matches;
-  applyTheme(prefersDark?'dark':'light');
+  if(saved){applyTheme(saved);currentThemeIdx=THEMES.indexOf(saved);if(currentThemeIdx<0)currentThemeIdx=0;return}
+  applyTheme('neon');
 })();
 
 function greeting(){
@@ -1860,13 +1969,13 @@ def connect_init():
 
     # Return challenge to app (encoded) — include key info for display
     # Also include latest broadcast if any
-    broadcast_msg = None
-    broadcast_id = None
+    broadcast_msg = ""
+    broadcast_id = ""
     if broadcasts_col is not None:
         latest_bc = broadcasts_col.find_one({'active': True}, sort=[('created_at', -1)])
         if latest_bc:
-            broadcast_msg = latest_bc.get('message', '')
-            broadcast_id = str(latest_bc.get('_id', ''))
+            broadcast_msg = latest_bc.get('message', '') or ''
+            broadcast_id = str(latest_bc.get('_id', '')) or ''
 
     return make_encoded_response({
         'valid': True,
